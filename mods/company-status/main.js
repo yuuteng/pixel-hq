@@ -2,10 +2,29 @@ import { View, div, svg } from "gpui-kit";
 import { h_flex } from "gpui-base";
 import { spaces, panes, focused, agents, theme, run, window, keys, setBadge, openOverlay, shared, setShared, appHome, exec, checking } from "herdr";
 
+const MONO = "JetBrains Mono, Menlo, monospace";
+
+function formatTime(seconds) {
+  if (!seconds || isNaN(seconds) || seconds < 0) return "00:00";
+  const s = Math.floor(seconds);
+  const m = Math.floor(s / 60);
+  const rem = s % 60;
+  if (m >= 60) {
+    const h = Math.floor(m / 60);
+    const remM = m % 60;
+    return `${h}:${remM.toString().padStart(2, "0")}:${rem.toString().padStart(2, "0")}`;
+  }
+  return `${m.toString().padStart(2, "0")}:${rem.toString().padStart(2, "0")}`;
+}
+
 export default class WorkspaceStatus extends View {
   init(_props, cx) {
     if (checking()) return;
     this.polling = false;
+    cx.timer.every(1000, (cx) => {
+      const music = shared("pixel-hq.music");
+      if (music?.playing) cx.notify();
+    });
     // Open PRs of mine whose CI failed, across every Claude session (company-prs/sessions.py).
     this.failed = [];
     const checkCi = (cx) => cx.spawn(async (cx) => {
@@ -25,13 +44,13 @@ export default class WorkspaceStatus extends View {
       this.polling = true;
       try {
         const script = `${appHome()}/mods/company-music/player.py`;
-        const candidates = window()?.platform === "windows" ? ["python", "python3", "py"] : ["python3", "python"];
+        const candidates = window()?.platform === "windows" ? ["pythonw", "python", "python3", "py"] : ["python3", "python"];
         for (const bin of candidates) {
-          const r = await exec(bin, [script, "status"], { timeout: 3000 }).catch(() => null);
+          const r = await exec(bin, [script, "status"], { timeout: 15000 }).catch(() => null);
           if (!r?.stdout) continue;
           try {
             const res = JSON.parse(r.stdout.trim().split("\n").pop());
-            if (res.playing !== music.playing || res.status !== music.status || (res.title && res.title !== music.title)) {
+            if (res.playing !== music.playing || res.status !== music.status || (res.title && res.title !== music.title) || (res.url && res.url !== music.url)) {
               setShared("pixel-hq.music", res);
               cx.notify();
             }
@@ -59,7 +78,7 @@ export default class WorkspaceStatus extends View {
     }
     try {
       const script = `${appHome()}/mods/company-music/player.py`;
-      const candidates = window()?.platform === "windows" ? ["python", "python3", "py"] : ["python3", "python"];
+      const candidates = window()?.platform === "windows" ? ["pythonw", "python", "python3", "py"] : ["python3", "python"];
       for (const bin of candidates) {
         const r = await exec(bin, [script, action], { timeout: 35000 }).catch(() => null);
         if (!r?.stdout) continue;
@@ -174,6 +193,12 @@ export default class WorkspaceStatus extends View {
           const isPaused = m?.status === "paused";
           const isBuffering = m?.status === "buffering";
           const title = m?.title || "MusicBox";
+
+          const nowSec = Math.floor(Date.now() / 1000);
+          const baseElapsed = Number(m?.elapsed || m?.currentElapsed || 0);
+          const liveElapsed = isPlaying && m?.startTime ? baseElapsed + Math.max(0, nowSec - m.startTime) : (m?.currentElapsed || baseElapsed);
+          const dur = Number(m?.duration || 0);
+          const timeText = dur > 0 ? `${formatTime(liveElapsed)}/${formatTime(dur)}` : formatTime(liveElapsed);
           if (isPlaying || isPaused || isBuffering) {
             const playPauseIcon = isPlaying ? "⏸" : "▶";
             const playPauseTooltip = isPlaying ? "Tạm dừng (Pause)" : "Tiếp tục phát (Resume)";
@@ -259,12 +284,19 @@ export default class WorkspaceStatus extends View {
                   .px(6)
                   .py(2)
                   .rounded(4)
-                  .max_w(170)
+                  .max_w(250)
                   .hover((s) => s.bg(t.hover))
-                  .tooltip(`Pixel MusicBox: ${title} · Mở bảng điều khiển`)
+                  .tooltip(`Pixel MusicBox: ${title} (${timeText}) · Mở bảng điều khiển`)
                   .on_click(() => run("mod.open", { name: "company-music" }))
                   .child(div().text_size(12).child("📻"))
                   .child(div().truncate().text_size(11.5).font_semibold().text_color(t.foreground).child(title))
+                  .child(
+                    div()
+                      .text_size(10)
+                      .font_family(MONO)
+                      .text_color(isPlaying ? "#89b4fa" : t.dim)
+                      .child(timeText)
+                  )
               );
           }
           return h_flex()
