@@ -6,6 +6,19 @@ export default class WorkspaceStatus extends View {
   init(_props, cx) {
     if (checking()) return;
     this.polling = false;
+    // Open PRs of mine whose CI failed, across every Claude session (company-prs/sessions.py).
+    this.failed = [];
+    const checkCi = (cx) => cx.spawn(async (cx) => {
+      const r = await exec("python3", ["-I", `${appHome()}/mods/company-prs/sessions.py`, "failed"], { timeout: 60000 }).catch(() => null);
+      if (r?.code !== 0) return;
+      let failed;
+      try { failed = JSON.parse(r.stdout).failed ?? []; } catch { return; }
+      if (JSON.stringify(failed) === JSON.stringify(this.failed)) return;
+      this.failed = failed;
+      cx.notify();
+    });
+    checkCi(cx);
+    cx.timer.every(60000, checkCi);
     cx.timer.every(3000, async (cx) => {
       if (this.polling) return;
       const music = shared("pixel-hq.music");
@@ -131,6 +144,11 @@ export default class WorkspaceStatus extends View {
       .when(n("done") > 0, el => el.child(pill(t.done ?? "#8ec07c", `${n("done")} shipped`)))
       .when(list.length - n("working") - n("blocked") - n("done") > 0, el => el.child(pill(t.dim ?? "#9a8f86", `${list.length - n("working") - n("blocked") - n("done")} on break`)))
       .child(div().flex_1())
+      .when(this.failed?.length > 0, el => el.child(div().id("ci-failed").cursor_pointer().flex_none().px(7).h(18).flex().items_center().rounded(4)
+        .bg("#f38ba826").text_color("#f38ba8").font_semibold().text_size(11).hover(s => s.bg("#f38ba840"))
+        .tooltip(`CI failed: ${this.failed.map(p => `${p.repo} #${p.number}`).join(", ")} · click for the PR panel`)
+        .on_click(() => { run("layout.select", { stack: "panel-body", child: "prs" }); run("layout.show", { id: "panel" }); })
+        .child(`✕ ${this.failed.length}`)))
       .child(
         (() => {
           const m = shared("pixel-hq.music");

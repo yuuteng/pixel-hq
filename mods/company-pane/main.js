@@ -1,10 +1,13 @@
 // A desk nameplate as the pane header: the agent's pixel pet, its job title, status and folder.
 import { View, div, svg, image } from "gpui-kit";
 import { h_flex } from "gpui-base";
-import { panes, props, run, theme, home, layout, spaces } from "herdr";
+import { panes, props, run, theme, home, layout, spaces, shared, exec } from "herdr";
 import { agentOf, duckMood, duckWidth, mood } from "./duck.js";
 
 const tabNameOf = (p) => { const tb = spaces().flatMap((s) => s.tabs).find((x) => x.id === p.tab); return tb?.named ? tb.name : ""; };
+const JIRA = "https://jira.example.com";
+// PROJ key from the Claude session name (polled by company-agents), else from the tab name.
+const ticketOf = (p) => shared("pixel-hq.sessions")?.[p.terminal]?.ticket ?? (tabNameOf(p).match(/\bPROJ-\d+\b/i)?.[0]?.toUpperCase() ?? null);
 const ROLE = (p) => agentOf(p.program?.key, tabNameOf(p))?.role ?? (p.program?.shell ? "Terminal" : (p.program?.name ?? "Contractor"));
 
 function paneFrame(node) {
@@ -56,6 +59,7 @@ export default class CompanyPane extends View {
       : st === "blocked" ? chip("needs you", t.blocked ?? "#e8744f")
       : st === "done" ? chip("shipped", t.done ?? "#8ec07c")
       : species ? chip("on break", t.dim ?? "#9a8f86") : null;
+    const ticket = ticketOf(p);
     return h_flex()
       .id(`pane-head-${pane}`)
       .size_full()
@@ -72,7 +76,12 @@ export default class CompanyPane extends View {
       .child(avatar)
       .child(h_flex().flex_none().gap(7).items_center()
         .child(div().truncate().max_w(220).font_semibold().text_color(t.foreground).child(title))
-        .child(div().flex_none().px(7).h(19).flex().items_center().rounded(5).bg("#89b4fa1f").text_size(10.5).text_color("#b4befe").child(ROLE(p))))
+        .child(div().flex_none().px(7).h(19).flex().items_center().rounded(5).bg("#89b4fa1f").text_size(10.5).text_color("#b4befe").child(ROLE(p)))
+        .when(Boolean(ticket), el => el.child(div().id(`ph-tk-${pane}`).flex_none().px(7).h(19).flex().items_center().rounded(5)
+          .bg("#89b4fa26").text_size(10.5).font_semibold().text_color("#89b4fa").cursor_pointer().hover(s => s.bg("#89b4fa40"))
+          .tooltip(`Open ${ticket} in Jira`)
+          .on_click((_e, cx) => { cx.stop_propagation(); exec("open", [`${JIRA}/browse/${ticket}`]).catch(() => null); })
+          .child(ticket))))
       .child(div().flex_1().truncate().text_color(t.dim).child(folder(p.cwd)))
       .when(Boolean(status), el => el.child(status))
       .when(this.hovered, el => el
