@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import re
 import time
 import shutil
 import signal
@@ -374,7 +375,8 @@ def find_player_bin():
             if os.path.isfile(path):
                 return path
     elif sys.platform == "darwin":
-        for path in ("/opt/homebrew/bin/ffplay", "/usr/local/bin/ffplay", "/opt/homebrew/bin/mpv", "/usr/local/bin/mpv"):
+        for path in ("/opt/homebrew/bin/ffplay", "/usr/local/bin/ffplay", os.path.expanduser("~/.Homebrew/bin/ffplay"),
+                     "/opt/homebrew/bin/mpv", "/usr/local/bin/mpv", os.path.expanduser("~/.Homebrew/bin/mpv")):
             if os.path.isfile(path):
                 return path
     return None
@@ -411,7 +413,7 @@ def find_ytdlp_bin():
             if os.path.isfile(path):
                 return path
     elif sys.platform == "darwin":
-        for path in ("/opt/homebrew/bin/yt-dlp", "/usr/local/bin/yt-dlp"):
+        for path in ("/opt/homebrew/bin/yt-dlp", "/usr/local/bin/yt-dlp", os.path.expanduser("~/.Homebrew/bin/yt-dlp")):
             if os.path.isfile(path):
                 return path
     try:
@@ -421,9 +423,26 @@ def find_ytdlp_bin():
         pass
     return None
 
+def is_bilibili_url(url):
+    u = (url or "").lower()
+    return "bilibili.com" in u or "b23.tv" in u or "bilivideo." in u
+
 def is_extractor_url(url):
     u = url.lower()
-    return "youtube.com" in u or "youtu.be" in u or "soundcloud.com" in u
+    return "youtube.com" in u or "youtu.be" in u or "soundcloud.com" in u or is_bilibili_url(u)
+
+def player_args(player_bin, stream_url, page_url=None):
+    """Bilibili's CDN refuses audio requests without a bilibili Referer."""
+    is_ffplay = "ffplay" in os.path.basename(player_bin).lower()
+    if is_ffplay:
+        args = [player_bin, "-nodisp", "-autoexit", "-loglevel", "quiet"]
+        if is_bilibili_url(page_url) or is_bilibili_url(stream_url):
+            args += ["-user_agent", "Mozilla/5.0", "-headers", "Referer: https://www.bilibili.com/\r\n"]
+        return args + [stream_url]
+    args = [player_bin, "--no-video", "--really-quiet"]
+    if is_bilibili_url(page_url) or is_bilibili_url(stream_url):
+        args += ["--referrer=https://www.bilibili.com/", "--user-agent=Mozilla/5.0"]
+    return args + [stream_url]
 
 def extract_stream_info(url):
     yt_dlp = find_ytdlp_bin()
@@ -468,6 +487,9 @@ def extract_stream_info(url):
                             pass
                     title_parts.append(l)
                 title = " ".join(title_parts).strip() if title_parts else derive_direct_title(url)
+                if is_bilibili_url(url):
+                    # Bilibili's Akamai mirror answers 5XX for some tracks; its overseas COS mirror serves the same signed path.
+                    stream_url = re.sub(r"^https://[^/]*akamaized\.net/", "https://upos-sz-mirrorcosov.bilivideo.com/", stream_url)
                 return title, stream_url, duration, None
     except Exception as e:
         return None, None, 0, f"Failed to extract stream: {str(e)}"
@@ -491,6 +513,8 @@ def derive_direct_title(url):
 
 def is_playlist_url(url):
     u = url.lower()
+    if is_bilibili_url(u):
+        return "/list/ml" in u or "/medialist/" in u or "favlist" in u
     return ("youtube.com" in u or "youtu.be" in u) and ("list=" in u)
 
 def extract_video_id(url):
@@ -522,13 +546,13 @@ def extract_playlist_items(url, limit=25):
     env["PYTHONIOENCODING"] = "utf-8"
     try:
         r = run_cmd(
-            [*cmd, "--encoding", "utf-8", "--no-warnings", "--flat-playlist", "--playlist-end", str(limit), "--print", "%(id)s\t%(title)s\t%(duration)s", url],
+            [*cmd, "--encoding", "utf-8", "--no-warnings", "--flat-playlist", "--playlist-end", str(limit), "--print", "%(id)s\t%(title)s\t%(duration)s\t%(url)s", url],
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
             env=env,
-            timeout=18
+            timeout=90 if is_bilibili_url(url) else 18
         )
         items = []
         if r.returncode == 0 and r.stdout.strip():
@@ -548,7 +572,7 @@ def extract_playlist_items(url, limit=25):
                         "id": v_id,
                         "title": t,
                         "duration": dur,
-                        "url": f"https://www.youtube.com/watch?v={v_id}",
+                        "url": parts[3].strip() if len(parts) > 3 and parts[3].strip().startswith("http") else f"https://www.youtube.com/watch?v={v_id}",
                         "stream_url": None,
                         "resolved_at": 0
                     })
@@ -603,7 +627,7 @@ def cmd_prefetch():
 
         if queue.get("needs_expansion") and queue.get("playlist_url"):
             p_url = queue["playlist_url"]
-            full_items = extract_playlist_items(p_url, limit=25)
+            full_items = extract_playlist_items(p_url, limit=500 if is_bilibili_url(p_url) else 25)
             q_fresh = read_queue()
             if q_fresh and q_fresh.get("needs_expansion"):
                 if full_items:
@@ -733,8 +757,7 @@ def cmd_play_queue_index(index):
         clear_state()
         return {"status": "error", "error": "Neither ffplay nor mpv found. Install ffmpeg or mpv to enable playback.", "playing": False}
 
-    is_ffplay = "ffplay" in os.path.basename(player_bin).lower()
-    args = [player_bin, "-nodisp", "-autoexit", "-loglevel", "quiet", stream_url] if is_ffplay else [player_bin, "--no-video", "--really-quiet", stream_url]
+    args = player_args(player_bin, stream_url, url)
     env = os.environ.copy()
     env["SDL_VIDEODRIVER"] = "dummy"
 
@@ -899,8 +922,7 @@ def cmd_play(url, preset_title=None):
             clear_state()
             return {"status": "error", "error": "Neither ffplay nor mpv found. Install ffmpeg or mpv to enable playback.", "playing": False, "history": read_history()}
 
-        is_ffplay = "ffplay" in os.path.basename(player_bin).lower()
-        args = [player_bin, "-nodisp", "-autoexit", "-loglevel", "quiet", ext_stream] if is_ffplay else [player_bin, "--no-video", "--really-quiet", ext_stream]
+        args = player_args(player_bin, ext_stream, first_url)
         env = os.environ.copy()
         env["SDL_VIDEODRIVER"] = "dummy"
 
@@ -983,7 +1005,7 @@ def cmd_play(url, preset_title=None):
     duration = 0
 
     if is_extractor_url(res):
-        source = "youtube" if "youtu" in res.lower() else "soundcloud"
+        source = "youtube" if "youtu" in res.lower() else "bilibili" if is_bilibili_url(res) else "soundcloud"
         ext_title, ext_stream, ext_dur, err = extract_stream_info(res)
         if err:
             clear_state()
@@ -999,8 +1021,7 @@ def cmd_play(url, preset_title=None):
             title = derive_direct_title(res)
             update_history_title(res, title)
 
-    is_ffplay = "ffplay" in os.path.basename(player_bin).lower()
-    args = [player_bin, "-nodisp", "-autoexit", "-loglevel", "quiet", stream_url] if is_ffplay else [player_bin, "--no-video", "--really-quiet", stream_url]
+    args = player_args(player_bin, stream_url, res)
     env = os.environ.copy()
     env["SDL_VIDEODRIVER"] = "dummy"
 

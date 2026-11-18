@@ -174,8 +174,10 @@ def test_7_missing_dependency_reporting():
         player.CACHE_DIR = td
         player.STATE_FILE = os.path.join(td, "state.json")
         orig_path = os.environ.get("PATH", "")
+        orig_home = os.environ.get("HOME", "")
         try:
             os.environ["PATH"] = td
+            os.environ["HOME"] = td
             res_direct = player.cmd_play("https://somafm.com/groovesalad.mp3")
             assert res_direct["status"] == "error"
             assert "Neither ffplay nor mpv found" in res_direct["error"]
@@ -197,6 +199,7 @@ def test_7_missing_dependency_reporting():
             player.CACHE_DIR = orig_cache
             player.STATE_FILE = orig_state
             os.environ["PATH"] = orig_path
+            os.environ["HOME"] = orig_home
     print("PASS: Test 7 - Missing dependency guidance errors verified")
 
 def test_8_next_prev_cycling():
