@@ -4,6 +4,14 @@ import { theme, run, shared, setShared, closeOverlay, checking, appHome, exec, w
 
 const MONO = "JetBrains Mono, Menlo, monospace";
 
+// Shown at once on Pause / Resume, before player.py answers: the real position frozen (or restarted) at the click.
+function flipPause(cur, pause) {
+  if (!cur) return cur;
+  const now = Date.now() / 1000;
+  const pos = typeof cur.position === "number" ? cur.position + (cur.playing && cur.positionAt ? Math.max(0, now - cur.positionAt) : 0) : cur.position;
+  return { ...cur, playing: !pause, status: pause ? "paused" : "playing", position: pos, positionAt: now };
+}
+
 function formatTime(seconds) {
   if (!seconds || isNaN(seconds) || seconds < 0) return "00:00";
   const s = Math.floor(seconds);
@@ -533,6 +541,8 @@ export default class CompanyMusic extends View {
   }
 
   async pause(cx) {
+    setShared("pixel-hq.music", flipPause(shared("pixel-hq.music"), true));
+    cx.notify();
     const script = `${appHome()}/mods/company-music/player.py`;
     const candidates = window()?.platform === "windows" ? ["pythonw", "python", "python3", "py"] : ["python3", "python"];
     for (const bin of candidates) {
@@ -548,6 +558,8 @@ export default class CompanyMusic extends View {
   }
 
   async resume(cx) {
+    setShared("pixel-hq.music", flipPause(shared("pixel-hq.music"), false));
+    cx.notify();
     const script = `${appHome()}/mods/company-music/player.py`;
     const candidates = window()?.platform === "windows" ? ["pythonw", "python", "python3", "py"] : ["python3", "python"];
     for (const bin of candidates) {

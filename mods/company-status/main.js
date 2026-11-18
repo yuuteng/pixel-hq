@@ -66,6 +66,15 @@ export default class WorkspaceStatus extends View {
   async musicAction(action, cx) {
     if (this.actionBusy) return;
     this.actionBusy = true;
+    if (action === "pause" || action === "resume") {
+      const cur = shared("pixel-hq.music");
+      if (cur) {
+        const now = Date.now() / 1000;
+        const pos = typeof cur.position === "number" ? cur.position + (cur.playing && cur.positionAt ? Math.max(0, now - cur.positionAt) : 0) : cur.position;
+        setShared("pixel-hq.music", { ...cur, playing: action === "resume", status: action === "pause" ? "paused" : "playing", position: pos, positionAt: now });
+        if (cx) cx.notify();
+      }
+    }
     if (action === "next" || action === "prev") {
       const cur = shared("pixel-hq.music");
       setShared("pixel-hq.music", {

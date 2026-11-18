@@ -1029,8 +1029,10 @@ def cmd_seek(seconds):
     except Exception as e:
         return {"status": "error", "error": f"Failed to start player process: {str(e)}", "playing": False}
     cur.update({"pid": proc.pid, "startTime": int(time.time()), "elapsed": int(pos), "currentElapsed": int(pos),
-                "status": "playing", "playing": True, "stream_url": stream, "position": pos, "positionAt": time.time()})
+                "status": "playing", "playing": True, "stream_url": stream})
+    cur.pop("position", None)
     write_state(cur)
+    cur.update({"position": pos, "positionAt": time.time()})
     cur["history"] = read_history()
     return cur
 
@@ -1392,7 +1394,9 @@ def cmd_pause():
     current["status"] = "paused"
     current["playing"] = False
     current["history"] = read_history()
+    current.pop("position", None)
     write_state(current)
+    current.update({"position": read_position(), "positionAt": time.time(), "mode": read_mode()})
     return current
 
 def cmd_resume():
@@ -1409,7 +1413,9 @@ def cmd_resume():
     current["status"] = "playing"
     current["playing"] = True
     current["history"] = read_history()
+    current.pop("position", None)
     write_state(current)
+    current.update({"position": read_position(), "positionAt": time.time(), "mode": read_mode()})
     return current
 
 def cmd_stop():
