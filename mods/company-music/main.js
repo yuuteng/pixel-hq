@@ -4,9 +4,22 @@ import { theme, run, shared, setShared, closeOverlay, checking, appHome, exec, w
 
 const MONO = "JetBrains Mono, Menlo, monospace";
 
+function formatTime(seconds) {
+  if (!seconds || isNaN(seconds) || seconds < 0) return "00:00";
+  const s = Math.floor(seconds);
+  const m = Math.floor(s / 60);
+  const rem = s % 60;
+  if (m >= 60) {
+    const h = Math.floor(m / 60);
+    const remM = m % 60;
+    return `${h}:${remM.toString().padStart(2, "0")}:${rem.toString().padStart(2, "0")}`;
+  }
+  return `${m.toString().padStart(2, "0")}:${rem.toString().padStart(2, "0")}`;
+}
+
 const PRESETS = [
   { id: "somafm-chill", title: "SomaFM Groove Salad", desc: "Ambient & Downtempo", url: "https://ice2.somafm.com/groovesalad-128-mp3", tag: "Direct MP3" },
-  { id: "nightwave", title: "Nightwave Plaza", desc: "Vaporwave & City Pop", url: "https://stream.plaza.one/mp3", tag: "Direct MP3" },
+  { id: "nightwave", title: "Nightwave Plaza", desc: "Vaporwave & City Pop", url: "https://radio.plaza.one/mp3", tag: "Direct MP3" },
   { id: "defcon", title: "SomaFM DEF CON", desc: "Hacker Chiptune & Beats", url: "https://ice1.somafm.com/defcon-128-mp3", tag: "Direct MP3" },
   { id: "dronezone", title: "SomaFM Drone Zone", desc: "Ambient Space & Focus", url: "https://ice6.somafm.com/dronezone-128-mp3", tag: "Direct MP3" },
 ];
@@ -21,6 +34,7 @@ export default class CompanyMusic extends View {
     this.installing = false;
     this.installMsg = null;
     this.installSuccess = null;
+    this.history = shared("pixel-hq.music")?.history || [];
 
     this.urlInput = InputState.new({ placeholder: "Paste YouTube, SoundCloud, or direct audio stream URL..." });
     this.urlInput.on("submit", (_e, cx) => this.play(this.urlInput.value(), null, cx));
@@ -43,18 +57,27 @@ export default class CompanyMusic extends View {
 
     cx.timer.after(150, () => this.urlInput.focus());
     this.checkDeps(cx);
+    this.loadHistory(cx);
 
-    cx.timer.every(1500, async (cx) => {
+    cx.timer.every(1000, (cx) => {
       const music = shared("pixel-hq.music");
-      if (music?.status !== "buffering") return;
+      if (music?.playing) cx.notify();
+    });
+
+    cx.timer.every(2000, async (cx) => {
+      const music = shared("pixel-hq.music");
+      if (music?.status !== "buffering" && !music?.playing) return;
       const script = `${appHome()}/mods/company-music/player.py`;
-      const candidates = window()?.platform === "windows" ? ["python", "python3", "py"] : ["python3", "python"];
+      const candidates = window()?.platform === "windows" ? ["pythonw", "python", "python3", "py"] : ["python3", "python"];
       for (const bin of candidates) {
-        const r = await exec(bin, [script, "status"], { timeout: 2500 }).catch(() => null);
+        const r = await exec(bin, [script, "status"], { timeout: 15000 }).catch(() => null);
         if (!r?.stdout) continue;
         try {
           const res = JSON.parse(r.stdout.trim().split("\n").pop());
-          if (res.status === "playing" || res.status === "error") {
+          if (Array.isArray(res?.history)) {
+            this.history = res.history;
+          }
+          if (res.status === "playing" || res.status === "error" || res.status === "idle") {
             this.busy = false;
             setShared("pixel-hq.music", res);
             cx.notify();
@@ -67,7 +90,7 @@ export default class CompanyMusic extends View {
 
   async checkDeps(cx) {
     const script = `${appHome()}/mods/company-music/player.py`;
-    const candidates = window()?.platform === "windows" ? ["python", "python3", "py"] : ["python3", "python"];
+    const candidates = window()?.platform === "windows" ? ["pythonw", "python", "python3", "py"] : ["python3", "python"];
     for (const bin of candidates) {
       const r = await exec(bin, [script, "check"], { timeout: 4000 }).catch(() => null);
       if (!r?.stdout) continue;
@@ -83,6 +106,36 @@ export default class CompanyMusic extends View {
         if (cx) cx.notify();
         break;
       } catch {}
+    }
+  }
+
+  async loadHistory(cx) {
+    const script = `${appHome()}/mods/company-music/player.py`;
+    const candidates = window()?.platform === "windows" ? ["pythonw", "python", "python3", "py"] : ["python3", "python"];
+    for (const bin of candidates) {
+      const r = await exec(bin, [script, "history"], { timeout: 3000 }).catch(() => null);
+      if (!r?.stdout) continue;
+      try {
+        const res = JSON.parse(r.stdout.trim().split("\n").pop());
+        if (Array.isArray(res?.history)) {
+          this.history = res.history;
+          if (cx) cx.notify();
+        }
+        break;
+      } catch {}
+    }
+  }
+
+  async clearHistory(cx) {
+    this.history = [];
+    const cur = shared("pixel-hq.music") || {};
+    setShared("pixel-hq.music", { ...cur, history: [] });
+    if (cx) cx.notify();
+    const script = `${appHome()}/mods/company-music/player.py`;
+    const candidates = window()?.platform === "windows" ? ["pythonw", "python", "python3", "py"] : ["python3", "python"];
+    for (const bin of candidates) {
+      const r = await exec(bin, [script, "clear-history"], { timeout: 3000 }).catch(() => null);
+      if (r?.stdout) break;
     }
   }
 
@@ -296,7 +349,7 @@ export default class CompanyMusic extends View {
     cx.notify();
 
     const script = `${appHome()}/mods/company-music/player.py`;
-    const candidates = window()?.platform === "windows" ? ["python", "python3", "py"] : ["python3", "python"];
+    const candidates = window()?.platform === "windows" ? ["pythonw", "python", "python3", "py"] : ["python3", "python"];
     const args = presetTitle ? [script, "play", cleanUrl, presetTitle] : [script, "play", cleanUrl];
 
     let res = null;
@@ -325,6 +378,11 @@ export default class CompanyMusic extends View {
       }
     } else if (res) {
       this.error = null;
+      if (Array.isArray(res.history)) {
+        this.history = res.history;
+      } else {
+        this.loadHistory(cx);
+      }
       setShared("pixel-hq.music", res);
     } else {
       this.error = "Could not start audio player. Verify Python, ffplay or mpv is installed.";
@@ -342,7 +400,7 @@ export default class CompanyMusic extends View {
 
   async pause(cx) {
     const script = `${appHome()}/mods/company-music/player.py`;
-    const candidates = window()?.platform === "windows" ? ["python", "python3", "py"] : ["python3", "python"];
+    const candidates = window()?.platform === "windows" ? ["pythonw", "python", "python3", "py"] : ["python3", "python"];
     for (const bin of candidates) {
       const r = await exec(bin, [script, "pause"], { timeout: 4000 }).catch(() => null);
       if (!r?.stdout) continue;
@@ -357,7 +415,7 @@ export default class CompanyMusic extends View {
 
   async resume(cx) {
     const script = `${appHome()}/mods/company-music/player.py`;
-    const candidates = window()?.platform === "windows" ? ["python", "python3", "py"] : ["python3", "python"];
+    const candidates = window()?.platform === "windows" ? ["pythonw", "python", "python3", "py"] : ["python3", "python"];
     for (const bin of candidates) {
       const r = await exec(bin, [script, "resume"], { timeout: 4000 }).catch(() => null);
       if (!r?.stdout) continue;
@@ -372,7 +430,7 @@ export default class CompanyMusic extends View {
 
   async stop(cx) {
     const script = `${appHome()}/mods/company-music/player.py`;
-    const candidates = window()?.platform === "windows" ? ["python", "python3", "py"] : ["python3", "python"];
+    const candidates = window()?.platform === "windows" ? ["pythonw", "python", "python3", "py"] : ["python3", "python"];
     for (const bin of candidates) {
       const r = await exec(bin, [script, "stop"], { timeout: 4000 }).catch(() => null);
       if (!r?.stdout) continue;
@@ -388,7 +446,7 @@ export default class CompanyMusic extends View {
 
   async next(cx) {
     const script = `${appHome()}/mods/company-music/player.py`;
-    const candidates = window()?.platform === "windows" ? ["python", "python3", "py"] : ["python3", "python"];
+    const candidates = window()?.platform === "windows" ? ["pythonw", "python", "python3", "py"] : ["python3", "python"];
     for (const bin of candidates) {
       const r = await exec(bin, [script, "next"], { timeout: 15000 }).catch(() => null);
       if (!r?.stdout) continue;
@@ -403,7 +461,7 @@ export default class CompanyMusic extends View {
 
   async prev(cx) {
     const script = `${appHome()}/mods/company-music/player.py`;
-    const candidates = window()?.platform === "windows" ? ["python", "python3", "py"] : ["python3", "python"];
+    const candidates = window()?.platform === "windows" ? ["pythonw", "python", "python3", "py"] : ["python3", "python"];
     for (const bin of candidates) {
       const r = await exec(bin, [script, "prev"], { timeout: 15000 }).catch(() => null);
       if (!r?.stdout) continue;
@@ -781,6 +839,13 @@ export default class CompanyMusic extends View {
     const isBuffering = music.status === "buffering" || this.busy;
     const isPaused = music.status === "paused";
     const currentTitle = music.title || (isPlaying ? "Audio Stream" : "No stream playing");
+
+    const nowSec = Math.floor(Date.now() / 1000);
+    const baseElapsed = Number(music.elapsed || music.currentElapsed || 0);
+    const liveElapsed = isPlaying && music.startTime ? baseElapsed + Math.max(0, nowSec - music.startTime) : (music.currentElapsed || baseElapsed);
+    const dur = Number(music.duration || 0);
+    const percent = dur > 0 ? Math.min(100, Math.max(0, Math.round((liveElapsed / dur) * 100))) : 0;
+
     const missingPlayer = Boolean(this.depStatus && !this.depStatus.has_player);
     const missingYtDlp = Boolean(this.depStatus && !this.depStatus.has_ytdlp);
     const rawError = this.error || music.error;
@@ -1066,6 +1131,77 @@ export default class CompanyMusic extends View {
                   )
               )
           )
+          .when(isPlaying || isPaused || isBuffering, (el) =>
+            el.child(
+              v_flex()
+                .w_full()
+                .gap(5)
+                .when(dur > 0, (bar) =>
+                  bar.child(
+                    div()
+                      .w_full()
+                      .h(4)
+                      .rounded(2)
+                      .bg("#1e1e2e")
+                      .overflow_hidden()
+                      .child(
+                        div()
+                          .h_full()
+                          .rounded(2)
+                          .bg(isPlaying ? "#89b4fa" : "#585b70")
+                          .w(`${Math.max(1, percent)}%`)
+                      )
+                  )
+                )
+                .child(
+                  h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                      h_flex()
+                        .gap(5)
+                        .items_center()
+                        .child(div().text_size(9.5).child("⏱"))
+                        .child(
+                          div()
+                            .text_size(10)
+                            .font_family(MONO)
+                            .font_semibold()
+                            .text_color(isPlaying ? "#cdd6f4" : t.dim)
+                            .child(
+                              dur > 0
+                                ? `${formatTime(liveElapsed)} / ${formatTime(dur)}`
+                                : `${formatTime(liveElapsed)} (Streaming)`
+                            )
+                        )
+                    )
+                    .when(dur > 0, (pct) =>
+                      pct.child(
+                        div()
+                          .text_size(9.5)
+                          .font_family(MONO)
+                          .font_semibold()
+                          .text_color(isPlaying ? "#89b4fa" : t.dim)
+                          .child(`${percent}%`)
+                      )
+                    )
+                    .when(dur <= 0, (tag) =>
+                      tag.child(
+                        div()
+                          .px(4)
+                          .py(1)
+                          .rounded(2)
+                          .bg("#313244")
+                          .text_size(8.5)
+                          .font_family(MONO)
+                          .text_color("#89b4fa")
+                          .child("LIVE")
+                      )
+                    )
+                )
+            )
+          )
           .child(
             h_flex()
               .gap(8)
@@ -1170,6 +1306,126 @@ export default class CompanyMusic extends View {
                 )
               )
           )
+      )
+      .when(Boolean(this.history && this.history.length > 0), (el) =>
+        el.child(
+          v_flex()
+            .gap(4)
+            .w_full()
+            .child(
+              h_flex()
+                .w_full()
+                .items_center()
+                .justify_between()
+                .child(
+                  div()
+                    .font_family(MONO)
+                    .text_size(10)
+                    .font_bold()
+                    .text_color(t.dim)
+                    .child(`RECENTLY PLAYED (${this.history.length})`)
+                )
+                .child(
+                  div()
+                    .cursor_pointer()
+                    .px(6)
+                    .py(1)
+                    .rounded(3)
+                    .text_size(9.5)
+                    .font_family(MONO)
+                    .text_color(t.dim)
+                    .hover((s) => s.text_color("#f38ba8"))
+                    .on_click((_e, cx) => this.clearHistory(cx))
+                    .child("✕ Clear")
+                )
+            )
+            .children(
+              this.history.map((h, i) => {
+                const active = music.url === h.url;
+                const isPl = h.type === "playlist";
+                const isYt = h.type === "youtube";
+                const badgeColor = isPl ? "#cba6f7" : isYt ? "#f38ba8" : "#89b4fa";
+                const badgeText = isPl ? "PLAYLIST" : isYt ? "YOUTUBE" : "STREAM";
+                const icon = isPl ? "📻" : isYt ? "🎬" : "🎵";
+
+                return h_flex()
+                  .id(`history-item-${i}`)
+                  .w_full()
+                  .h(34)
+                  .px(8)
+                  .gap(8)
+                  .items_center()
+                  .justify_between()
+                  .rounded(6)
+                  .bg(active ? "#313244" : "#11111b")
+                  .border_1()
+                  .border_color(active ? "#89b4fa" : "#313244")
+                  .cursor_pointer()
+                  .hover((s) => s.border_color("#89b4fa"))
+                  .on_click((_e, cx) => {
+                    this.urlInput.set_value(h.url);
+                    this.play(h.url, h.title, cx);
+                  })
+                  .child(
+                    h_flex()
+                      .gap(6)
+                      .items_center()
+                      .min_w(0)
+                      .flex_1()
+                      .child(
+                        div()
+                          .px(5)
+                          .py(1)
+                          .rounded(3)
+                          .bg(`${badgeColor}22`)
+                          .border_1()
+                          .border_color(`${badgeColor}55`)
+                          .text_size(8.5)
+                          .font_family(MONO)
+                          .font_bold()
+                          .text_color(badgeColor)
+                          .child(`${icon} ${badgeText}`)
+                      )
+                      .child(
+                        v_flex()
+                          .gap(1)
+                          .min_w(0)
+                          .flex_1()
+                          .child(
+                            div()
+                              .font_semibold()
+                              .text_size(11)
+                              .text_color(active ? "#89b4fa" : t.foreground)
+                              .truncate()
+                              .child(h.title || h.url)
+                          )
+                          .child(
+                            div()
+                              .text_size(9)
+                              .font_family(MONO)
+                              .text_color(t.dim)
+                              .truncate()
+                              .child(h.url)
+                          )
+                      )
+                  )
+                  .child(
+                    div()
+                      .px(6)
+                      .py(2)
+                      .rounded(3)
+                      .bg(active && isPlaying ? "#a6e3a122" : "#181825")
+                      .border_1()
+                      .border_color(active && isPlaying ? "#a6e3a155" : "#313244")
+                      .text_size(9)
+                      .font_family(MONO)
+                      .font_semibold()
+                      .text_color(active && isPlaying ? "#a6e3a1" : "#cdd6f4")
+                      .child(active && isPlaying ? "● PLAYING" : "▶ Play")
+                  );
+              })
+            )
+        )
       )
       .child(
         v_flex()
