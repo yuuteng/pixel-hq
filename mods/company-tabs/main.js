@@ -31,7 +31,7 @@ function label(tab, lead) {
 export default class Tabs extends View {
   init(_props, cx) {
     this.pressed = null;
-    // `company-tabs.toggle-prs` (ctrl+shift+r) opens or closes the PR panel.
+    // `company-tabs.toggle-prs` (cmd+shift+r in keys.json) opens or closes the PR panel.
     if (!checking()) cx.spawn(async () => { for (;;) { if (await nextCommand() === "toggle-prs") this.togglePanel("prs"); } });
     this.scroll = ScrollHandle.new();
     try { this.panels = JSON.parse(localStorage.getItem("panels") ?? "{}"); } catch { this.panels = {}; }
