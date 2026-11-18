@@ -50,7 +50,7 @@ export default class WorkspaceStatus extends View {
           if (!r?.stdout) continue;
           try {
             const res = JSON.parse(r.stdout.trim().split("\n").pop());
-            if (res.playing !== music.playing || res.status !== music.status || (res.title && res.title !== music.title) || (res.url && res.url !== music.url)) {
+            if (res.playing !== music.playing || res.status !== music.status || (res.title && res.title !== music.title) || (res.url && res.url !== music.url) || (res.lyrics?.length ?? -1) !== (music?.lyrics?.length ?? -1) || res.position !== music?.position) {
               setShared("pixel-hq.music", res);
               cx.notify();
             }
@@ -198,7 +198,11 @@ export default class WorkspaceStatus extends View {
           const baseElapsed = Number(m?.elapsed || m?.currentElapsed || 0);
           const liveElapsed = isPlaying && m?.startTime ? baseElapsed + Math.max(0, nowSec - m.startTime) : (m?.currentElapsed || baseElapsed);
           const dur = Number(m?.duration || 0);
-          const timeText = dur > 0 ? `${formatTime(liveElapsed)}/${formatTime(dur)}` : formatTime(liveElapsed);
+          // Time and lyrics (LRCLIB, via player.py) follow ffplay's own audio clock, advanced from the moment it was read.
+          const lyricAt = typeof m?.position === "number" ? m.position + (isPlaying && m.positionAt ? Math.max(0, Date.now() / 1000 - m.positionAt) : 0) : null;
+          const shownAt = lyricAt !== null ? Math.min(dur > 0 ? dur : Infinity, lyricAt) : liveElapsed;
+          const timeText = dur > 0 ? `${formatTime(shownAt)}/${formatTime(dur)}` : formatTime(shownAt);
+          const lyric = lyricAt !== null && Array.isArray(m?.lyrics) ? m.lyrics.filter((l) => l[0] <= lyricAt).pop()?.[1] : null;
           if (isPlaying || isPaused || isBuffering) {
             const playPauseIcon = isPlaying ? "⏸" : "▶";
             const playPauseTooltip = isPlaying ? "Tạm dừng (Pause)" : "Tiếp tục phát (Resume)";
@@ -284,12 +288,12 @@ export default class WorkspaceStatus extends View {
                   .px(6)
                   .py(2)
                   .rounded(4)
-                  .max_w(250)
+                  .flex_none()
                   .hover((s) => s.bg(t.hover))
                   .tooltip(`Pixel MusicBox: ${title} (${timeText}) · Mở bảng điều khiển`)
                   .on_click(() => run("mod.open", { name: "company-music" }))
                   .child(div().text_size(12).child("📻"))
-                  .child(div().truncate().text_size(11.5).font_semibold().text_color(t.foreground).child(title))
+                  .child(div().max_w(380).truncate().text_size(11.5).font_semibold().text_color(lyric ? "#f9e2af" : t.foreground).child(lyric ? `♪ ${lyric}` : title))
                   .child(
                     div()
                       .text_size(10)
