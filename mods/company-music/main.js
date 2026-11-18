@@ -1,5 +1,5 @@
-import { View, div } from "gpui-kit";
-import { v_flex, h_flex, InputState, Input } from "gpui-base";
+import { View, div, svg } from "gpui-kit";
+import { v_flex, h_flex, InputState, Input, ScrollHandle } from "gpui-base";
 import { theme, run, shared, setShared, closeOverlay, checking, appHome, exec, window, props } from "herdr";
 
 const MONO = "JetBrains Mono, Menlo, monospace";
@@ -59,6 +59,12 @@ export default class CompanyMusic extends View {
     this.checkDeps(cx);
     this.loadHistory(cx);
 
+    // The play queue of a playlist (YouTube list or Bilibili favorites): shown as a clickable track list.
+    this.queue = null;
+    this.queueScroll = ScrollHandle.new();
+    this.loadQueue(cx);
+    cx.timer.every(3000, (cx) => this.loadQueue(cx));
+
     cx.timer.every(1000, (cx) => {
       const music = shared("pixel-hq.music");
       if (music?.playing) cx.notify();
@@ -86,6 +92,134 @@ export default class CompanyMusic extends View {
         } catch {}
       }
     });
+  }
+
+  async loadQueue(cx) {
+    if (this.queueLoading) return;
+    this.queueLoading = true;
+    const script = `${appHome()}/mods/company-music/player.py`;
+    const r = await exec("python3", [script, "queue"], { timeout: 5000 }).catch(() => null);
+    this.queueLoading = false;
+    if (!r?.stdout) return;
+    try {
+      const q = JSON.parse(r.stdout.trim().split("\n").pop());
+      if (q.mode && q.mode !== this.mode) { this.mode = q.mode; cx.notify(); }
+      if (JSON.stringify(q) === JSON.stringify(this.queue)) return;
+      this.queue = q;
+      cx.notify();
+    } catch {}
+  }
+
+  async enqueue(url, cx) {
+    if (!url || !url.trim() || this.queueing || this.busy) return;
+    this.queueing = true;
+    this.error = null;
+    cx.notify();
+    const script = `${appHome()}/mods/company-music/player.py`;
+    const r = await exec("python3", [script, "enqueue", url.trim()], { timeout: 60000 }).catch(() => null);
+    this.queueing = false;
+    try {
+      const res = JSON.parse(r.stdout.trim().split("\n").pop());
+      if (res.status === "error") this.error = res.error;
+      else if (res.status === "ok") {
+        this.urlInput.set_value("");
+        this.queuedMsg = `+${res.added} ✓`;
+        cx.timer.after(2000, (cx) => { this.queuedMsg = null; cx.notify(); });
+      } else setShared("pixel-hq.music", res);
+    } catch {
+      this.error = "Could not add this link.";
+    }
+    this.loadQueue(cx);
+    cx.notify();
+  }
+
+  async seek(seconds, cx) {
+    const script = `${appHome()}/mods/company-music/player.py`;
+    const r = await exec("python3", [script, "seek", seconds.toFixed(2)], { timeout: 30000 }).catch(() => null);
+    this.seekAt = null;
+    try {
+      const res = JSON.parse(r.stdout.trim().split("\n").pop());
+      if (res.status === "error") this.error = res.error;
+      else { this.error = null; setShared("pixel-hq.music", res); }
+    } catch {}
+    cx.notify();
+  }
+
+  async cycleMode(cx) {
+    const script = `${appHome()}/mods/company-music/player.py`;
+    const r = await exec("python3", [script, "mode", "next"], { timeout: 5000 }).catch(() => null);
+    try { this.mode = JSON.parse(r.stdout.trim().split("\n").pop()).mode ?? this.mode; } catch {}
+    cx.notify();
+  }
+
+  async jump(index, cx) {
+    if (this.busy) return;
+    this.busy = true;
+    if (this.queue) this.queue = { ...this.queue, current_index: index };
+    const cur = shared("pixel-hq.music") ?? {};
+    setShared("pixel-hq.music", { ...cur, playing: false, status: "buffering", title: this.queue?.items?.[index]?.title || "Buffering stream..." });
+    cx.notify();
+    const script = `${appHome()}/mods/company-music/player.py`;
+    const r = await exec("python3", [script, "jump", String(index)], { timeout: 35000 }).catch(() => null);
+    this.busy = false;
+    try {
+      const res = JSON.parse(r.stdout.trim().split("\n").pop());
+      if (res.status === "error") this.error = res.error;
+      else { this.error = null; setShared("pixel-hq.music", res); }
+    } catch {}
+    this.loadQueue(cx);
+    cx.notify();
+  }
+
+  queueList(t) {
+    const q = this.queue;
+    const items = q?.items ?? [];
+    const cur = q?.current_index ?? 0;
+    if (cur !== this.queueShown && items.length) { this.queueShown = cur; this.queueScroll.scroll_to_item(cur); }
+    const fmt = (sec) => { const s = Math.max(0, Math.floor(sec || 0)); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`; };
+    return v_flex()
+      .gap(4)
+      .w_full()
+      .child(
+        div()
+          .font_family(MONO)
+          .text_size(10)
+          .font_bold()
+          .text_color(t.dim)
+          .child(`${q?.name ? `${q.name} · ` : "PLAYLIST · "}${items.length}${q?.expanding ? "…" : ""} tracks`)
+      )
+      .child(
+        v_flex()
+          .id("queue-list")
+          .w_full()
+          .h(Math.min(items.length, 6) * 30 + 4)
+          .flex_none()
+          .overflow_y_scrollbar()
+          .track_scroll(this.queueScroll)
+          .gap(2)
+          .children(items.map((it, i) => {
+            const on = i === cur;
+            return h_flex()
+              .id(`queue-item-${i}`)
+              .w_full()
+              .h(28)
+              .flex_none()
+              .px(8)
+              .gap(8)
+              .items_center()
+              .rounded(5)
+              .bg(on ? "#313244" : "#11111b")
+              .border_1()
+              .border_color(on ? "#89b4fa" : "#11111b")
+              .cursor_pointer()
+              .hover((s) => s.border_color("#89b4fa"))
+              .tooltip(it.title)
+              .on_click((_e, cx) => { if (!on) this.jump(i, cx); })
+              .child(div().flex_none().w(24).text_size(10).font_family(MONO).text_color(on ? "#89b4fa" : t.dim).child(on ? "▶" : String(i + 1)))
+              .child(div().flex_1().min_w(0).truncate().text_size(11).font_semibold().text_color(on ? "#89b4fa" : t.foreground).child(it.title && it.title !== "NA" && it.title !== "YouTube Track" ? it.title : "…"))
+              .child(div().flex_none().text_size(10).font_family(MONO).text_color(t.dim).child(it.duration ? fmt(it.duration) : ""));
+          }))
+      );
   }
 
   async checkDeps(cx) {
@@ -842,8 +976,11 @@ export default class CompanyMusic extends View {
 
     const nowSec = Math.floor(Date.now() / 1000);
     const baseElapsed = Number(music.elapsed || music.currentElapsed || 0);
-    const liveElapsed = isPlaying && music.startTime ? baseElapsed + Math.max(0, nowSec - music.startTime) : (music.currentElapsed || baseElapsed);
+    // ffplay's own clock (player.py `position`), advanced from when it was read; the start-time count only without it.
+    const realPos = typeof music.position === "number" ? music.position + (isPlaying && music.positionAt ? Math.max(0, Date.now() / 1000 - music.positionAt) : 0) : null;
+    const counted = isPlaying && music.startTime ? baseElapsed + Math.max(0, nowSec - music.startTime) : (music.currentElapsed || baseElapsed);
     const dur = Number(music.duration || 0);
+    const liveElapsed = this.seekAt != null ? this.seekAt : Math.min(dur > 0 ? dur : Infinity, realPos ?? counted);
     const percent = dur > 0 ? Math.min(100, Math.max(0, Math.round((liveElapsed / dur) * 100))) : 0;
 
     const missingPlayer = Boolean(this.depStatus && !this.depStatus.has_player);
@@ -862,6 +999,15 @@ export default class CompanyMusic extends View {
         }
       })
       .size_full()
+      .on_mouse_move((e, cx) => {
+        if (this.seekAt == null || !this.barW) return;
+        this.seekAt = Math.max(0, Math.min(1, (e.position.x - this.barLeft) / this.barW)) * this.seekDur;
+        cx.notify();
+      })
+      .on_mouse_up("left", (_e, cx) => {
+        if (this.seekAt == null) return;
+        this.seek(this.seekAt, cx);
+      })
       .bg("#181825")
       .border_1()
       .border_color("#45475a")
@@ -964,6 +1110,24 @@ export default class CompanyMusic extends View {
                   .hover((s) => s.opacity(0.88))
                   .on_click((_e, cx) => this.play(this.urlInput.value(), null, cx))
                   .child(this.busy ? "⏳ Starting..." : "▶ Play")
+              )
+              .child(
+                div()
+                  .id("btn-enqueue")
+                  .h(30)
+                  .px(10)
+                  .rounded(6)
+                  .bg("#313244")
+                  .cursor_pointer()
+                  .flex()
+                  .items_center()
+                  .font_bold()
+                  .text_size(11)
+                  .text_color(this.queueing ? "#6c7086" : "#cdd6f4")
+                  .hover((s) => s.bg("#45475a"))
+                  .tooltip("Add to the end of the current list")
+                  .on_click((_e, cx) => this.enqueue(this.urlInput.value(), cx))
+                  .child(this.queueing ? "⏳ Adding..." : this.queuedMsg || "+ Queue")
               )
           )
       )
@@ -1084,11 +1248,15 @@ export default class CompanyMusic extends View {
               .justify_between()
               .child(
                 h_flex()
+                  .flex_1()
+                  .min_w(0)
                   .gap(8)
                   .items_center()
-                  .child(div().text_size(14).child("📻"))
+                  .child(div().flex_none().text_size(14).child("📻"))
                   .child(
                     v_flex()
+                      .flex_1()
+                      .min_w(0)
                       .gap(2)
                       .child(div().text_size(9.5).font_family(MONO).text_color(t.dim).child("NOW PLAYING"))
                       .child(div().font_bold().text_size(12).text_color(t.foreground).truncate().child(currentTitle))
@@ -1096,6 +1264,8 @@ export default class CompanyMusic extends View {
               )
               .child(
                 div()
+                  .flex_none()
+                  .ml(8)
                   .px(7)
                   .py(2)
                   .rounded(4)
@@ -1139,17 +1309,36 @@ export default class CompanyMusic extends View {
                 .when(dur > 0, (bar) =>
                   bar.child(
                     div()
+                      .id("seek-bar")
                       .w_full()
-                      .h(4)
-                      .rounded(2)
-                      .bg("#1e1e2e")
-                      .overflow_hidden()
+                      .h(14)
+                      .flex()
+                      .items_center()
+                      .cursor_pointer()
+                      .tooltip("Click or drag to jump")
+                      .on_size_change((size) => { this.barW = size.width; })
+                      .on_mouse_down("left", (e, cx) => {
+                        if (!this.barW || !e.local_position) return;
+                        cx.stop_propagation();
+                        this.barLeft = e.position.x - e.local_position.x;
+                        this.seekDur = dur;
+                        this.seekAt = Math.max(0, Math.min(1, e.local_position.x / this.barW)) * dur;
+                        cx.notify();
+                      })
                       .child(
                         div()
-                          .h_full()
-                          .rounded(2)
-                          .bg(isPlaying ? "#89b4fa" : "#585b70")
-                          .w(`${Math.max(1, percent)}%`)
+                          .w_full()
+                          .h(this.seekAt != null ? 6 : 4)
+                          .rounded(3)
+                          .bg("#1e1e2e")
+                          .overflow_hidden()
+                          .child(
+                            div()
+                              .h_full()
+                              .rounded(3)
+                              .bg(isPlaying || this.seekAt != null ? "#89b4fa" : "#585b70")
+                              .w(`${Math.max(1, percent)}%`)
+                          )
                       )
                   )
                 )
@@ -1304,9 +1493,32 @@ export default class CompanyMusic extends View {
                     .on_click((_e, cx) => this.next(cx))
                     .child("⏭ Next")
                 )
+                .child(
+                  div()
+                    .id("btn-mode")
+                    .h(26)
+                    .px(8)
+                    .rounded(4)
+                    .bg(this.mode && this.mode !== "order" ? "#89b4fa33" : "#313244")
+                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .text_size(11)
+                    .font_family(MONO)
+                    .font_semibold()
+                    .text_color(this.mode && this.mode !== "order" ? "#89b4fa" : "#cdd6f4")
+                    .hover((s) => s.bg("#45475a"))
+                    .tooltip(({ order: "In order", loop: "Repeat list", one: "Repeat one", shuffle: "Shuffle" })[this.mode || "order"] + " · click to switch")
+                    .on_click((_e, cx) => this.cycleMode(cx))
+                    .justify_center()
+                    .min_w(30)
+                    .child(svg(`mods/company-music/mode-${this.mode || "order"}.svg`).size(15)
+                      .text_color(this.mode && this.mode !== "order" ? "#89b4fa" : "#cdd6f4"))
+                )
               )
           )
       )
+      .when((this.queue?.items?.length ?? 0) > 1 && (isPlaying || isPaused || isBuffering), (el) => el.child(this.queueList(t)))
       .when(Boolean(this.history && this.history.length > 0), (el) =>
         el.child(
           v_flex()
@@ -1426,51 +1638,6 @@ export default class CompanyMusic extends View {
               })
             )
         )
-      )
-      .child(
-        v_flex()
-          .gap(4)
-          .w_full()
-          .child(div().font_family(MONO).text_size(10).font_bold().text_color(t.dim).child("DIRECT STREAM PRESETS (NO YT-DLP NEEDED)"))
-          .children(
-            PRESETS.map((p) => {
-              const active = music.url === p.url;
-              return h_flex()
-                .id(p.id)
-                .w_full()
-                .h(32)
-                .px(8)
-                .gap(8)
-                .items_center()
-                .justify_between()
-                .rounded(6)
-                .bg(active ? "#313244" : "#11111b")
-                .border_1()
-                .border_color(active ? "#89b4fa" : "#313244")
-                .cursor_pointer()
-                .hover((s) => s.border_color("#89b4fa"))
-                .on_click((_e, cx) => this.play(p.url, p.title, cx))
-                .child(
-                  h_flex()
-                    .gap(6)
-                    .items_center()
-                    .min_w(0)
-                    .child(div().font_semibold().text_size(11).text_color(active ? "#89b4fa" : t.foreground).truncate().child(p.title))
-                    .child(div().text_size(10).text_color(t.dim).child(`· ${p.desc}`))
-                )
-                .child(
-                  div()
-                    .px(6)
-                    .py(1)
-                    .rounded(3)
-                    .bg("#181825")
-                    .text_size(9)
-                    .font_family(MONO)
-                    .text_color(active ? "#89b4fa" : "#6c7086")
-                    .child(p.tag)
-                );
-            })
-          )
       );
   }
 }

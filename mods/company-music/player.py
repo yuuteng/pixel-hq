@@ -38,6 +38,9 @@ STATE_FILE = os.path.join(CACHE_DIR, "state.json")
 QUEUE_FILE = os.path.join(CACHE_DIR, "queue.json")
 PREFETCH_PID_FILE = os.path.join(CACHE_DIR, "prefetch.pid")
 HISTORY_FILE = os.path.join(CACHE_DIR, "history.json")
+POSITION_FILE = os.path.join(CACHE_DIR, "position.log")
+MODE_FILE = os.path.join(CACHE_DIR, "mode.json")
+MODES = ("order", "loop", "one", "shuffle")
 POOL_SIZE = 5
 MAX_HISTORY = 3
 
@@ -345,6 +348,16 @@ def stop_all_players(keep_queue=False):
             run_cmd(["taskkill", "/F", "/IM", "mpv.exe"], capture_output=True, timeout=2)
         except Exception:
             pass
+    else:
+        # Two plays close together can leave a second player the state file never knew: end every player this module started.
+        for pattern in ("ffplay -nodisp -autoexit", "mpv --no-video --really-quiet"):
+            try:
+                r = run_cmd(["pgrep", "-f", pattern], capture_output=True, text=True, timeout=2)
+                for p in r.stdout.split():
+                    if p.isdigit() and int(p) != os.getpid():
+                        stop_process(int(p), True)
+            except Exception:
+                pass
     if not keep_queue:
         clear_queue()
     clear_state()
@@ -431,15 +444,35 @@ def is_extractor_url(url):
     u = url.lower()
     return "youtube.com" in u or "youtu.be" in u or "soundcloud.com" in u or is_bilibili_url(u)
 
-def player_args(player_bin, stream_url, page_url=None):
+def position_log():
+    """ffplay -stats writes its audio clock (seconds played) here; a new track starts a new file."""
+    ensure_cache_dir()
+    return open(POSITION_FILE, "wb")
+
+def read_position():
+    """The playing track's real position in seconds, from ffplay's last stats line; None when unknown."""
+    try:
+        with open(POSITION_FILE, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 400))
+            tail = f.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+    found = re.findall(r"(-?\d+\.\d+)\s+M-A:", tail)
+    return float(found[-1]) if found else None
+
+def player_args(player_bin, stream_url, page_url=None, start=0):
     """Bilibili's CDN refuses audio requests without a bilibili Referer."""
     is_ffplay = "ffplay" in os.path.basename(player_bin).lower()
     if is_ffplay:
-        args = [player_bin, "-nodisp", "-autoexit", "-loglevel", "quiet"]
+        args = [player_bin, "-nodisp", "-autoexit", "-loglevel", "quiet", "-stats"]
+        if start > 0:
+            args += ["-ss", f"{start:.2f}"]
         if is_bilibili_url(page_url) or is_bilibili_url(stream_url):
             args += ["-user_agent", "Mozilla/5.0", "-headers", "Referer: https://www.bilibili.com/\r\n"]
         return args + [stream_url]
-    args = [player_bin, "--no-video", "--really-quiet"]
+    args = [player_bin, "--no-video", "--really-quiet"] + ([f"--start={start:.2f}"] if start > 0 else [])
     if is_bilibili_url(page_url) or is_bilibili_url(stream_url):
         args += ["--referrer=https://www.bilibili.com/", "--user-agent=Mozilla/5.0"]
     return args + [stream_url]
@@ -536,7 +569,50 @@ def extract_video_id(url):
         pass
     return None
 
+def bilibili_fav_id(url):
+    m = re.search(r"/(?:list|medialist/detail)/ml(\d+)", url or "") or re.search(r"[?&]fid=(\d+)", url or "")
+    return m.group(1) if m else None
+
+def bilibili_fav(url, limit=500):
+    """A public Bilibili favorites list's name and tracks, with titles and durations, from Bilibili's web API."""
+    fid = bilibili_fav_id(url)
+    if not fid:
+        return None, []
+    import urllib.request
+    name, items, page = None, [], 1
+    while len(items) < limit:
+        api = f"https://api.bilibili.com/x/v3/fav/resource/list?media_id={fid}&pn={page}&ps=20&platform=web"
+        try:
+            req = urllib.request.Request(api, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.bilibili.com/"})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                d = json.loads(r.read().decode("utf-8"))
+        except Exception:
+            break
+        data = d.get("data") or {}
+        if d.get("code") != 0:
+            break
+        name = name or (data.get("info") or {}).get("title")
+        for m in data.get("medias") or []:
+            if m.get("attr") or not m.get("bvid"):
+                continue
+            items.append({
+                "id": m["bvid"],
+                "title": m.get("title") or m["bvid"],
+                "duration": int(m.get("duration") or 0),
+                "url": f"https://www.bilibili.com/video/{m['bvid']}",
+                "stream_url": None,
+                "resolved_at": 0
+            })
+        if not data.get("has_more"):
+            break
+        page += 1
+    return name, items[:limit]
+
 def extract_playlist_items(url, limit=25):
+    if bilibili_fav_id(url):
+        _name, items = bilibili_fav(url, limit)
+        if items:
+            return items
     yt_dlp = find_ytdlp_bin()
     if not yt_dlp:
         return []
@@ -560,7 +636,7 @@ def extract_playlist_items(url, limit=25):
                 parts = line.split("\t")
                 if len(parts) >= 2 and parts[0].strip():
                     v_id = parts[0].strip()
-                    t = parts[1].strip() or "YouTube Track"
+                    t = parts[1].strip() if parts[1].strip() not in ("", "NA") else "YouTube Track"
                     d_str = parts[2].strip() if len(parts) > 2 else ""
                     dur = 0
                     try:
@@ -641,8 +717,10 @@ def cmd_prefetch():
                                 if cur_items:
                                     full_items[idx] = cur_items[0]
                                 break
-                    q_fresh["items"] = full_items
+                    q_fresh["items"] = full_items + q_fresh.get("extra", [])
                     q_fresh["current_index"] = matched_idx
+                    if bilibili_fav_id(p_url):
+                        q_fresh["name"] = bilibili_fav(p_url, 1)[0]
                     q_fresh["needs_expansion"] = False
                     write_queue(q_fresh)
 
@@ -765,7 +843,7 @@ def cmd_play_queue_index(index):
         proc = popen_cmd(
             args,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=position_log(),
             stdin=subprocess.DEVNULL,
             env=env,
             start_new_session=True if sys.platform != "win32" else False
@@ -793,9 +871,245 @@ def cmd_play_queue_index(index):
         },
         "history": read_history()
     }
+    state["stream_url"] = stream_url
+    state["streamAt"] = int(time.time())
     write_state(state)
     launch_prefetch_worker()
+    launch_lyrics(url)
     return state
+
+def cmd_enqueue(url):
+    """Adds a link (one track, or a whole playlist / Bilibili favorites) to the end of the play queue."""
+    valid, res = validate_url(url)
+    if not valid:
+        return {"status": "error", "error": res, "playing": False}
+    st = cmd_status()
+    if not st.get("playing") and st.get("status") not in ("paused", "buffering"):
+        return cmd_play(res)
+    if is_playlist_url(res):
+        new = extract_playlist_items(res, limit=500 if is_bilibili_url(res) else 200)
+    else:
+        if is_extractor_url(res):
+            title, stream, dur, err = extract_stream_info(res)
+            if err or not stream:
+                return {"status": "error", "error": err or "Could not read this link", "playing": st.get("playing", False)}
+        else:
+            title, stream, dur = derive_direct_title(res), res, 0
+        new = [{"id": res, "title": title, "duration": dur or 0, "url": res, "stream_url": stream, "resolved_at": int(time.time())}]
+    if not new:
+        return {"status": "error", "error": "Nothing to add from this link", "playing": st.get("playing", False)}
+    queue = read_queue()
+    if not queue or not queue.get("items"):
+        cur = read_state() or {}
+        queue = {"playlist_url": None, "current_index": 0, "needs_expansion": False, "items": [{
+            "id": cur.get("url"), "title": re.sub(r"^\[\d+/\d+\] ", "", cur.get("title") or ""),
+            "duration": cur.get("duration", 0), "url": cur.get("url"), "stream_url": None, "resolved_at": 0}]}
+    queue["items"].extend(new)
+    if queue.get("needs_expansion"):
+        queue.setdefault("extra", []).extend(new)
+    write_queue(queue)
+    cur = read_state()
+    if cur:
+        total = len(queue["items"])
+        idx = queue.get("current_index", 0)
+        cur["playlist"] = {"index": idx + 1, "total": total}
+        cur["title"] = f"[{idx + 1}/{total}] " + re.sub(r"^\[\d+/\d+\] ", "", cur.get("title") or "")
+        write_state(cur)
+    if st.get("playing"):
+        launch_prefetch_worker()
+    return {"status": "ok", "added": len(new), "total": len(queue["items"]), "playing": st.get("playing", False)}
+
+ARTIST_ALIASES = {"taylor swift": ["霉霉"], "rosé": ["rose", "朴彩英"], "jj lin": ["林俊杰"], "eason chan": ["陈奕迅"], "jay chou": ["周杰伦"]}
+
+def clean_title(title):
+    t = re.sub(r"^\[\d+/\d+\] ", "", title or "")
+    return re.sub(r"【[^】]*】|\[[^\]]*\]", " ", t).strip()
+
+def song_candidates(title):
+    """Song names a video title may carry: the text in 《》, or either side of " - "."""
+    t = clean_title(title)
+    out = []
+    for m in re.finditer(r"《([^》]+)》", t):
+        out += [m.group(1).strip(), re.sub(r"[（(][^)）]*[)）]", "", m.group(1)).strip()]
+    if " - " in t:
+        left, right = [x.strip() for x in t.split(" - ", 1)]
+        out += [left, re.sub(r"[（(].*$", "", right).strip(), re.sub(r"\s*(官方|MV|Official).*$", "", right, flags=re.I).strip()]
+    lead = re.match(r"^[A-Za-z0-9][A-Za-z0-9' ,.&!?-]*[A-Za-z0-9]", t)
+    if lead and len(lead.group(0)) >= 4:
+        out.append(lead.group(0).strip())
+    seen = []
+    for c in out:
+        if c and c not in seen:
+            seen.append(c)
+    return seen
+
+def artist_in_title(artist, title):
+    """The singer a lyrics hit names must also appear in the video title (by name or a common nickname)."""
+    t = (title or "").lower()
+    names = [n.strip().lower() for n in re.split(r"\s*[/、&,，;×]\s*|\s+x\s+|\s+feat\.?\s+|\s+ft\.?\s+", artist or "") if n.strip()]
+    for n in names:
+        if n in t or any(a.lower() in t for a in ARTIST_ALIASES.get(n, [])):
+            return True
+    return False
+
+def parse_lrc(text):
+    lines = []
+    for raw in (text or "").splitlines():
+        stamps = re.findall(r"\[(\d+):(\d+(?:\.\d+)?)\]", raw)
+        words = re.sub(r"\[[^\]]*\]", "", raw).strip()
+        for mm, ss in stamps:
+            if words:
+                lines.append([round(int(mm) * 60 + float(ss), 2), words])
+    return sorted(lines)
+
+def find_lyrics(title, dur):
+    """Synced lyrics whose singer appears in the title and whose length is within 5 s of the track; else []."""
+    if dur <= 0:
+        return []
+    import urllib.request
+    for song in song_candidates(title):
+        q = urllib.parse.urlencode({"track_name": song})
+        try:
+            req = urllib.request.Request(f"https://lrclib.net/api/search?{q}", headers={"User-Agent": "pixel-hq-musicbox"})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                hits = json.loads(r.read().decode("utf-8"))
+        except Exception:
+            continue
+        for h in hits:
+            if h.get("syncedLyrics") and abs(float(h.get("duration") or 0) - dur) <= 5 and artist_in_title(h.get("artistName"), re.sub(r"^\[\d+/\d+\] ", "", title or "")):
+                lines = parse_lrc(h["syncedLyrics"])
+                if lines:
+                    return lines
+    return []
+
+def cmd_lyrics(url):
+    """Looks up synced lyrics on LRCLIB for the track now playing; keeps none unless singer and length match."""
+    cur = read_state()
+    if not cur or cur.get("url") != url or "lyrics" in cur:
+        return {"status": "ok"}
+    found = find_lyrics(cur.get("title"), float(cur.get("duration") or 0))
+    cur = read_state()
+    if cur and cur.get("url") == url:
+        cur["lyrics"] = found
+        write_state(cur)
+    return {"status": "ok", "lines": len(found)}
+
+def launch_lyrics(url):
+    try:
+        popen_cmd([sys.executable, os.path.abspath(__file__), "lyrics", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                  stdin=subprocess.DEVNULL, start_new_session=True if sys.platform != "win32" else False)
+    except Exception:
+        pass
+
+def cmd_seek(seconds):
+    """Restarts the current track's player at `seconds`; the queue and the rest of the state stay."""
+    cur = read_state()
+    if not cur or not cur.get("pid") or not cur.get("url"):
+        return {"status": "error", "error": "Nothing is playing", "playing": False}
+    dur = float(cur.get("duration") or 0)
+    pos = max(0.0, min(float(seconds), dur - 1 if dur > 1 else float(seconds)))
+    stream = cur.get("stream_url")
+    if not stream or int(time.time()) - int(cur.get("streamAt") or 0) > 5400:
+        if is_extractor_url(cur["url"]):
+            _t, stream, _d, err = extract_stream_info(cur["url"])
+            if err or not stream:
+                return {"status": "error", "error": err or "Could not reopen this track", "playing": cur.get("playing", False)}
+        else:
+            stream = cur["url"]
+        cur["streamAt"] = int(time.time())
+    player_bin = find_player_bin()
+    if not player_bin:
+        return {"status": "error", "error": "Neither ffplay nor mpv found. Install ffmpeg or mpv to enable playback.", "playing": False}
+    stop_process(cur["pid"], cur.get("status") == "paused")
+    env = os.environ.copy()
+    env["SDL_VIDEODRIVER"] = "dummy"
+    try:
+        proc = popen_cmd(player_args(player_bin, stream, cur["url"], pos), stdout=subprocess.DEVNULL, stderr=position_log(),
+                         stdin=subprocess.DEVNULL, env=env, start_new_session=True if sys.platform != "win32" else False)
+    except Exception as e:
+        return {"status": "error", "error": f"Failed to start player process: {str(e)}", "playing": False}
+    cur.update({"pid": proc.pid, "startTime": int(time.time()), "elapsed": int(pos), "currentElapsed": int(pos),
+                "status": "playing", "playing": True, "stream_url": stream, "position": pos, "positionAt": time.time()})
+    write_state(cur)
+    cur["history"] = read_history()
+    return cur
+
+def read_mode():
+    try:
+        with open(MODE_FILE, "r", encoding="utf-8") as f:
+            m = json.load(f).get("mode")
+        return m if m in MODES else "order"
+    except Exception:
+        return "order"
+
+def cmd_mode(mode):
+    """Play order: order (stop at the end), loop (the list), one (the current track), shuffle."""
+    if mode == "next":
+        mode = MODES[(MODES.index(read_mode()) + 1) % len(MODES)]
+    if mode not in MODES:
+        return {"status": "error", "error": f"mode is one of {', '.join(MODES)}"}
+    ensure_cache_dir()
+    with open(MODE_FILE, "w", encoding="utf-8") as f:
+        json.dump({"mode": mode}, f)
+    queue = read_queue()
+    if queue and queue.get("items"):
+        queue["played"] = [queue.get("current_index", 0)]
+        write_queue(queue)
+    return {"status": "ok", "mode": mode}
+
+def next_index(queue, auto):
+    """The track to play after the current one, by play mode; None when an ordered list has ended."""
+    items = queue.get("items") or []
+    n, cur, mode = len(items), queue.get("current_index", 0), read_mode()
+    if not n:
+        return None
+    if mode == "one" and auto:
+        return cur
+    if mode == "shuffle" and n > 1:
+        import random
+        played = [i for i in queue.get("played") or [] if i < n]
+        if cur not in played:
+            played.append(cur)
+        left = [i for i in range(n) if i not in played]
+        if not left:
+            played, left = [cur], [i for i in range(n) if i != cur]
+        nxt = random.choice(left)
+        queue["played"] = played + [nxt]
+        write_queue(queue)
+        return nxt
+    if cur + 1 < n:
+        return cur + 1
+    return 0 if (mode in ("loop", "shuffle") or not auto) else None
+
+def cmd_queue():
+    """The play queue: its name, the current index and every track's title and duration."""
+    queue = read_queue() or {}
+    items = queue.get("items") or []
+    missing = lambda it: (it.get("title") or "NA") in ("NA", "YouTube Track")
+    # The prefetch worker is still expanding the list: leave the file to it, or this write would undo its work.
+    if not queue.get("needs_expansion") and bilibili_fav_id(queue.get("playlist_url")) and (not queue.get("name") or any(missing(it) for it in items)):
+        name, fav = bilibili_fav(queue["playlist_url"])
+        by_id = {f["id"]: f for f in fav}
+        fresh = read_queue() or {}
+        if [it.get("id") for it in fresh.get("items") or []] == [it.get("id") for it in items]:
+            for it in fresh["items"]:
+                f = by_id.get(it.get("id"))
+                if f and missing(it):
+                    it["title"] = f["title"]
+                    it["duration"] = it.get("duration") or f["duration"]
+            if name:
+                fresh["name"] = name
+            write_queue(fresh)
+            queue, items = fresh, fresh["items"]
+    return {
+        "status": "ok",
+        "name": queue.get("name"),
+        "playlist_url": queue.get("playlist_url"),
+        "current_index": queue.get("current_index", 0),
+        "expanding": bool(queue.get("needs_expansion")),
+        "mode": read_mode(),
+        "items": [{"title": it.get("title") or "", "duration": it.get("duration") or 0} for it in items],
+    }
 
 def read_history():
     if not os.path.exists(HISTORY_FILE):
@@ -930,7 +1244,7 @@ def cmd_play(url, preset_title=None):
             proc = popen_cmd(
                 args,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=position_log(),
                 stdin=subprocess.DEVNULL,
                 env=env,
                 start_new_session=True if sys.platform != "win32" else False
@@ -972,9 +1286,12 @@ def cmd_play(url, preset_title=None):
             },
             "history": read_history()
         }
+        state["stream_url"] = ext_stream
+        state["streamAt"] = int(time.time())
         write_state(state)
         update_history_title(res, f"Playlist: {display_title}")
         launch_prefetch_worker()
+        launch_lyrics(first_url)
         return state
 
     item_type = "youtube" if is_extractor_url(res) else "direct"
@@ -1029,7 +1346,7 @@ def cmd_play(url, preset_title=None):
         proc = popen_cmd(
             args,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=position_log(),
             stdin=subprocess.DEVNULL,
             env=env,
             start_new_session=True if sys.platform != "win32" else False
@@ -1051,7 +1368,10 @@ def cmd_play(url, preset_title=None):
         "source": source,
         "history": read_history()
     }
+    state["stream_url"] = stream_url
+    state["streamAt"] = int(time.time())
     write_state(state)
+    launch_lyrics(res)
     return state
 
 def cmd_pause():
@@ -1107,6 +1427,9 @@ def cmd_status():
         current["currentElapsed"] = current_elapsed
         current["history"] = read_history()
 
+        current["mode"] = read_mode()
+        current["position"] = read_position()
+        current["positionAt"] = time.time()
         proc_alive = is_valid_player_proc(current["pid"])
         is_expired = is_playing and dur > 0 and current_elapsed >= dur + 1.5
 
@@ -1127,16 +1450,23 @@ def cmd_status():
             current["history"] = read_history()
             return current
 
+    # A track that died within 5 s failed to play: never repeat it, move on.
+    failed = bool(current and int(time.time()) - int(current.get("startTime") or 0) < 5)
     queue = read_queue()
     if queue and queue.get("items"):
-        cur_idx = queue.get("current_index", 0)
-        items = queue.get("items", [])
-        if cur_idx + 1 < len(items):
-            res = cmd_play_queue_index(cur_idx + 1)
+        nxt = next_index(queue, auto=True)
+        if failed and nxt == queue.get("current_index", 0):
+            nxt = nxt + 1 if nxt + 1 < len(queue["items"]) else None
+        if nxt is not None:
+            res = cmd_play_queue_index(nxt)
             res["history"] = read_history()
             return res
         else:
             clear_queue()
+    elif current and current.get("url") and read_mode() in ("one", "loop") and not failed:
+        res = cmd_play(current["url"], re.sub(r"^\[\d+/\d+\] ", "", current.get("title") or "") or None)
+        res["history"] = read_history()
+        return res
 
     orphan_pid = find_running_player_pid()
     if orphan_pid:
@@ -1163,7 +1493,7 @@ def cmd_next():
     queue = read_queue()
     if queue and queue.get("items"):
         if queue.get("needs_expansion") and queue.get("playlist_url"):
-            full_items = extract_playlist_items(queue["playlist_url"], limit=25)
+            full_items = extract_playlist_items(queue["playlist_url"], limit=500 if is_bilibili_url(queue["playlist_url"]) else 25)
             if full_items:
                 cur_items = queue.get("items", [])
                 cur_id = cur_items[0]["id"] if cur_items else None
@@ -1175,16 +1505,12 @@ def cmd_next():
                             if cur_items:
                                 full_items[idx] = cur_items[0]
                             break
-                queue["items"] = full_items
+                queue["items"] = full_items + queue.get("extra", [])
                 queue["current_index"] = matched_idx
             queue["needs_expansion"] = False
             write_queue(queue)
-        cur_idx = queue.get("current_index", 0)
-        items = queue.get("items", [])
-        if cur_idx + 1 < len(items):
-            return cmd_play_queue_index(cur_idx + 1)
-        else:
-            return cmd_play_queue_index(0)
+        nxt = next_index(queue, auto=False)
+        return cmd_play_queue_index(nxt if nxt is not None else 0)
 
     current = read_state()
     cur_url = current.get("url") if current else None
@@ -1200,7 +1526,7 @@ def cmd_prev():
     queue = read_queue()
     if queue and queue.get("items"):
         if queue.get("needs_expansion") and queue.get("playlist_url"):
-            full_items = extract_playlist_items(queue["playlist_url"], limit=25)
+            full_items = extract_playlist_items(queue["playlist_url"], limit=500 if is_bilibili_url(queue["playlist_url"]) else 25)
             if full_items:
                 cur_items = queue.get("items", [])
                 cur_id = cur_items[0]["id"] if cur_items else None
@@ -1212,11 +1538,17 @@ def cmd_prev():
                             if cur_items:
                                 full_items[idx] = cur_items[0]
                             break
-                queue["items"] = full_items
+                queue["items"] = full_items + queue.get("extra", [])
                 queue["current_index"] = matched_idx
             queue["needs_expansion"] = False
             write_queue(queue)
         cur_idx = queue.get("current_index", 0)
+        played = queue.get("played") or []
+        if read_mode() == "shuffle" and len(played) > 1 and played[-1] == cur_idx:
+            played.pop()
+            queue["played"] = played
+            write_queue(queue)
+            return cmd_play_queue_index(played[-1])
         if cur_idx > 0:
             return cmd_play_queue_index(cur_idx - 1)
         else:
@@ -1268,6 +1600,24 @@ def main():
         out = cmd_play(url, preset)
     elif action == "prefetch":
         out = cmd_prefetch()
+    elif action == "enqueue":
+        out = cmd_enqueue(sys.argv[2] if len(sys.argv) > 2 else "")
+    elif action == "lyrics":
+        out = cmd_lyrics(sys.argv[2] if len(sys.argv) > 2 else "")
+    elif action == "seek":
+        try:
+            out = cmd_seek(float(sys.argv[2]))
+        except (IndexError, ValueError):
+            out = {"status": "error", "error": "seek needs a position in seconds", "playing": False}
+    elif action == "mode":
+        out = cmd_mode(sys.argv[2] if len(sys.argv) > 2 else "next")
+    elif action == "queue":
+        out = cmd_queue()
+    elif action == "jump":
+        try:
+            out = cmd_play_queue_index(int(sys.argv[2]))
+        except (IndexError, ValueError):
+            out = {"status": "error", "error": "jump needs a track index", "playing": False}
     elif action == "pause":
         out = cmd_pause()
     elif action == "resume":
