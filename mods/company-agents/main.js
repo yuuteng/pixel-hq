@@ -97,6 +97,7 @@ function vitalsBars(t, ctx, id, width) {
 // platform (the former lsof-based path needed sh and Unix).
 const homeDir = () => process.env.HOME ?? process.env.USERPROFILE ?? "";
 const agyHome = () => process.env.AGY_HOME ?? `${homeDir()}/.gemini/antigravity-cli`;
+const tabNameOf = (a) => { const tb = spaces().flatMap((s) => s.tabs).find((x) => x.id === a?.tab); return tb?.named ? tb.name : ""; };
 const progOf = (a) => {
   const fg = a?.foreground;
   const fgArgv = Array.isArray(fg?.argv) ? fg.argv.join(" ") : "";
@@ -530,7 +531,7 @@ export default class Agents extends View {
             run("pane.focus", { pane: a.pane });
             closeOverlay(props().overlay);
           })
-          .child(div().flex_none().child(figureFor(a.space_name, "blocked", 34, at ? Math.max(0, now - at) : 0, speciesOf(progOf(a)))))
+          .child(div().flex_none().child(figureFor(a.space_name, "blocked", 34, at ? Math.max(0, now - at) : 0, speciesOf(progOf(a), tabNameOf(a)))))
           .child(v_flex().flex_1().min_w(0).gap(1)
             .child(div().truncate().text_size(12.5).text_color(t.foreground).child(name))
             .child(div().truncate().text_size(10.5).text_color(t.muted).child(sub)))
@@ -1195,7 +1196,7 @@ export default class Agents extends View {
     }
 
     const row = (a, i, subs = []) => {
-      const pic = figureFor(a.space_name, a.status, 45, this.waitOf(a.address, a.status, now), speciesOf(progOf(a)));
+      const pic = figureFor(a.space_name, a.status, 45, this.waitOf(a.address, a.status, now), speciesOf(progOf(a), tabNameOf(a)));
       const more = detail.get(a.address);
       // An agent on another machine (`vps/t7`) says which.
       const machine = a.address.includes("/") ? a.address.split("/")[0] : null;
@@ -1349,7 +1350,7 @@ export default class Agents extends View {
       } else localStorage.setItem("petpos", JSON.stringify(this.petpos));
       cx.notify();
     };
-    const ROLES = (a) => (agentOf(a.program?.key)?.role ?? "").toLowerCase();
+    const ROLES = (a) => (agentOf(a.program?.key, tabNameOf(a))?.role ?? "").toLowerCase();
     const STATE = { working: "typing working busy", idle: "idle break coffee snooze urge sleeping", done: "shipped done finished", blocked: "needs you blocked waiting" };
     const q = this.query.trim().toLowerCase();
     const hitOf = (a) => !q || q.split(/\s+/).every((w) => [detail.get(a.address), a.space_name, label(a), a.program?.name, ROLES(a), STATE[a.status]].join(" ").toLowerCase().includes(w));
@@ -1433,7 +1434,7 @@ export default class Agents extends View {
           .left(away ? dx : 0).top(away ? dy : 0)
           // Glide out and back, but not while it is being dragged, so it follows the pointer exactly.
           .when(this.drag?.addr !== a.address, (el) => el.transition("left", 800).transition("top", 800))
-          .child(figureFor(a.space_name, isNudged ? "done" : a.status, PET, unseen, speciesOf(progOf(a)))))
+          .child(figureFor(a.space_name, isNudged ? "done" : a.status, PET, unseen, speciesOf(progOf(a), tabNameOf(a)))))
         // Shipped: pixel confetti rains over the desk until someone looks at it.
         .when(a.status === "done", (el) => el.children([["#f9e2af", 0.10, 900], ["#f38ba8", 0.22, 1300], ["#a6e3a1", 0.34, 1000], ["#89b4fa", 0.46, 1500], ["#cba6f7", 0.58, 1100], ["#fab387", 0.70, 1400], ["#94e2d5", 0.82, 950]]
           .map(([c, fx0, p], j) => div().absolute().left(petW * fx0).top(-20).w(4).h(4).bg(c).loop("top", { from: -22 - (j % 3) * 6, to: PET * 0.55, period: p, easing: "linear" }))))

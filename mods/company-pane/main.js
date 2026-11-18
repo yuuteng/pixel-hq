@@ -1,10 +1,11 @@
 // A desk nameplate as the pane header: the agent's pixel pet, its job title, status and folder.
 import { View, div, svg, image } from "gpui-kit";
 import { h_flex } from "gpui-base";
-import { panes, props, run, theme, home, layout } from "herdr";
+import { panes, props, run, theme, home, layout, spaces } from "herdr";
 import { agentOf, duckMood, duckWidth, mood } from "./duck.js";
 
-const ROLE = (p) => agentOf(p.program?.key)?.role ?? (p.program?.shell ? "Terminal" : (p.program?.name ?? "Contractor"));
+const tabNameOf = (p) => { const tb = spaces().flatMap((s) => s.tabs).find((x) => x.id === p.tab); return tb?.named ? tb.name : ""; };
+const ROLE = (p) => agentOf(p.program?.key, tabNameOf(p))?.role ?? (p.program?.shell ? "Terminal" : (p.program?.name ?? "Contractor"));
 
 function paneFrame(node) {
   if (!node || node.hidden) return null;
@@ -41,7 +42,7 @@ export default class CompanyPane extends View {
     if (!p) return div();
     const st = p.status;
     const pane = p.pane;
-    const species = agentOf(p.program?.key)?.species ?? null;
+    const species = agentOf(p.program?.key, tabNameOf(p))?.species ?? null;
     const bottom = paneFrame(layout())?.header?.position === "bottom";
     const H = 30;
     const avatar = species

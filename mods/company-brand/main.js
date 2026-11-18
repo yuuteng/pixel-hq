@@ -2,6 +2,9 @@ import { View, div, image, svg } from "gpui-kit";
 import { h_flex, v_flex } from "gpui-base";
 import { theme, run, props, window, shared, setShared, updates, layout } from "herdr";
 
+const greeting = () => { const h = new Date().getHours(); return `${h >= 5 && h < 12 ? "Good morning" : h >= 12 && h < 18 ? "Good afternoon" : "Good evening"}, Teng`; };
+const today = () => { const d = new Date(); return `${["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][d.getDay()]} · ${d.getDate()} ${["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][d.getMonth()]}`; };
+
 function find(node, id) {
   if (node?.id === id) return node;
   for (const child of node?.children ?? []) {
@@ -51,8 +54,8 @@ export default class WorkspaceChrome extends View {
     return h_flex().size_full().bg(t.chrome).pl(collapsed ? 6 : 14).pr(10).gap(4).items_center().text_size(13.5)
       .when(window()?.platform === "macos" && !window()?.fullscreen && !collapsed, el => el.pl(76))
       .when(!collapsed, el => el.child(h_flex().flex_1().gap(9).items_center().child(logo)
-        .child(v_flex().gap(0).child(div().font_semibold().text_size(14).text_color(t.foreground).child("Pixel HQ"))
-          .child(div().text_size(10).text_color(t.dim).child("engineering floor")))))
+        .child(v_flex().gap(0).child(div().font_semibold().text_size(14).text_color(t.foreground).child(greeting()))
+          .child(div().text_size(10).text_color(t.dim).child(today())))))
       .when(!collapsed, el => el.child(this.button("hotkeys", svg("mods/company-brand/keyboard.svg").size(15), () => run("mod.open", { name: "company-hotkeys" }))))
       .when(!collapsed, el => el.child(this.button("search", svg("mods/company-brand/search.svg").size(15), () => run("mod.open", { name: "picker" }))))
       // On the macOS rail the traffic lights fill the row; the agents list's » unfolds it.

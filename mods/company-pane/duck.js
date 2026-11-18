@@ -36,16 +36,29 @@ const SPECIES = {
 };
 
 const AGENTS = [
-  { match: (k) => k.includes("claude"), species: "crab", role: "Staff Engineer" },
+  { match: (k) => k.includes("claude"), species: "crab", role: "Developer" },
   { match: (k) => k.includes("codex"), species: "bot", role: "Code Reviewer" },
   { match: (k) => k.includes("opencode"), species: "penguin", role: "Platform Engineer" },
   { match: (k) => k.includes("antigravity") || k === "agy", species: "arch", role: "Systems Architect" },
 ];
-export function agentOf(key) {
+// Job by tab name, for agents only: the first role whose word is in the name wins.
+const ROLES = [
+  { words: ["alert", "oncall", "incident"], species: "penguin", role: "On-call Engineer" },
+  { words: ["qa", "test"], species: "penguin", role: "QA Engineer" },
+  { words: ["review", "cr"], species: "bot", role: "Code Reviewer" },
+  { words: ["plan", "arch"], species: "arch", role: "Architect" },
+  { words: ["pm", "product", "doc", "note"], species: "sheep", role: "Product Manager" },
+  { words: ["dev"], species: "crab", role: "Developer" },
+];
+export function agentOf(key, tabName) {
   const k = String(key ?? "").toLowerCase();
-  return AGENTS.find((a) => a.match(k)) ?? null;
+  const base = AGENTS.find((a) => a.match(k)) ?? null;
+  if (!base) return null;
+  const toks = String(tabName ?? "").toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  const hit = (w) => toks.some((t) => t === w || t === w + "s" || (w.length >= 4 && t.startsWith(w)));
+  return ROLES.find((r) => r.words.some(hit)) || base;
 }
-export const speciesOf = (key) => agentOf(key)?.species ?? "sheep";
+export const speciesOf = (key, tabName) => agentOf(key, tabName)?.species ?? "sheep";
 
 // Antigravity's arch: a smooth bell, warm at the crown (red and orange), cooling through yellow and green to blue feet.
 // Built once from thin rows (10 units tall), each blended left to right, so it reads as a soft gradient.

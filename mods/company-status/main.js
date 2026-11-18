@@ -97,7 +97,6 @@ export default class WorkspaceStatus extends View {
     const label = (icon, text) => h_flex().gap(6).items_center().child(svg(`mods/workspace-chrome/${icon}.svg`).size(13)).child(text);
     const pill = (color, text) => h_flex().gap(6).items_center().child(div().size(7).rounded(4).bg(color)).child(text);
     return h_flex().size_full().px(14).gap(16).items_center().bg(t.chrome).border_t(1).border_color(t.border).text_size(11.8).text_color(t.muted)
-      .child(div().font_semibold().text_color("#b4befe").child("Pixel HQ"))
       .child(label(space?.machine ? "server" : "monitor", space?.machine ?? "This computer"))
       .when(Boolean(currentBranch), el => el.child(label("branch", currentBranch)))
       .child(div().text_color(t.dim).child(`${list.length} on the team`))
