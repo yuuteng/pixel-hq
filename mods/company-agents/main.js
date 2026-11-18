@@ -11,6 +11,8 @@ import { Editor } from "./editor.js";
 import { checkPixelHqUpdate, executePixelHqUpdate } from "./updater.js";
 import { snapshot, clashes, hire, agentTaskArgv } from "./crew.js";
 
+const JIRA = "https://jira.ovhcloud.tools";
+
 // The figure editor, as a dialog; `space` opens it on that space's pick.
 const openFigures = (space) => openOverlay({ mod: "company-agents", kind: "dialog", width: 860, height: 640, props: { figures: true, ...(space ? { space } : {}) } });
 
@@ -309,6 +311,10 @@ export default class Agents extends View {
     this.repoInput = InputState.new({ placeholder: "Repo folder" });
     this.ticketInput.on("submit", (_e, cx) => this.doHire(cx));
     this.repoInput.on("submit", (_e, cx) => this.doHire(cx));
+    // Jira ticket per desk, from the Claude session name (company-prs/sessions.py); shared with the pane header.
+    this.sessions = {};
+    this.pollSessions(cx);
+    cx.timer.every(5000, (cx) => this.pollSessions(cx));
     // Who is about to step on whom: every few seconds, ask git what each desk has changed.
     this.clash = new Map();
     this.clashSig = "";
@@ -1064,6 +1070,27 @@ export default class Agents extends View {
     this.pendingSetupCodex = !ok;
   }
 
+  pollSessions(cx) {
+    if (this.polling) return;
+    this.polling = true;
+    cx.spawn(async (cx) => {
+      const r = await exec("python3", ["-I", `${appHome()}/mods/company-prs/sessions.py`], { timeout: 20000 }).catch(() => null);
+      this.polling = false;
+      if (r?.code !== 0) return;
+      let next;
+      try { next = JSON.parse(r.stdout).terminals ?? {}; } catch { return; }
+      if (JSON.stringify(next) === JSON.stringify(this.sessions)) return;
+      this.sessions = next;
+      setShared("pixel-hq.sessions", next);
+      cx.notify();
+    });
+  }
+
+  // PDATA key from the Claude session name, else from the tab name.
+  ticketOf(a) {
+    return this.sessions[a.address]?.ticket ?? (tabNameOf(a).match(/\bPDATA-\d+\b/i)?.[0]?.toUpperCase() ?? null);
+  }
+
   render(cx) {
     const t = theme();
     if (props()?.sortMenu) return this.sortMenu(t);
@@ -1324,7 +1351,7 @@ export default class Agents extends View {
     const fieldTop = horizon + 20;
     const nAgents = list.length;
     const paneBy = new Map(panes().map((p) => [p.pane, p]));
-    const withBranch = list.some((a) => paneBy.get(a.pane)?.branch);
+    const withBranch = list.some((a) => this.ticketOf(a));
     const withVitals = list.some((a) => contextOf.get(a.address));
     const plan = (sc, extraVitals) => {
       const P = Math.round(46 * sc), pw = duckWidth(P), cw = Math.max(pw + Math.round(24 * sc), 76), ch = P + Math.round(28 * sc) + 26 + (withBranch ? 15 : 0) + extraVitals;
@@ -1384,6 +1411,7 @@ export default class Agents extends View {
       const text = more ?? a.space_name ?? label(a);
       // The desk's branch (its own worktree, ideally) and whether another desk is about to step on it.
       const branch = paneBy.get(a.pane)?.branch ?? null;
+      const ticket = this.ticketOf(a);
       const cl = this.clash.get(a.address) ?? null;
       const clText = cl ? (cl.kind === "file" ? `clash: ${String(cl.files[0] ?? "").split("/").pop()}${cl.files.length > 1 ? ` +${cl.files.length - 1}` : ""}` : "same folder") : "";
       const clTip = cl ? (cl.kind === "file" ? `Another desk also changed ${cl.files.join(", ")}` : "Another desk is working in this same folder") : "";
@@ -1490,11 +1518,14 @@ export default class Agents extends View {
           .bg(this.hint?.addr === a.address ? "#cba6f7" : cl ? (cl.kind === "file" ? "#ff5370" : "#f9b84a") : a.focused || (q && hitOf(a)) ? "#f9e2af" : hot ? "#f38ba8" : isUrge ? "#fab387" : isSnooze ? "#45475a" : "#0f111acc")
           .text_size(10.5).text_color(this.hint?.addr === a.address ? "#1e1233" : cl ? "#2a0f16" : a.focused || (q && hitOf(a)) ? "#2a1a14" : isUrge ? "#1e1e2e" : isSnooze ? "#cdd6f4" : "#ffffff").truncate()
           .child(this.hint?.addr === a.address ? this.hint.text : cl ? clText : `${text}${when && cellW >= 90 ? (isUrge ? ` · idle ${duration(waited)} ⏰` : isSnooze ? ` · zzz ${duration(waited)}` : ` · ${duration(waited)}`) : ""}`))
-        .when(Boolean(branch) || Boolean(modelTxt), (el) => el.child(h_flex().mt(2).gap(3).items_center().max_w(Math.max(petW + 22, cellW - 4)).text_size(9.5)
-          .when(Boolean(branch), (el) => el
-            .child(div().relative().w(8).h(10).flex_none().children([[0, 0, 2, 2], [0, 8, 2, 2], [5, 2, 2, 2], [0, 2, 1, 6], [1, 4, 5, 1]].map(([x, y, w, h]) => div().absolute().left(x).top(y).w(w).h(h).bg("#89b4fa"))))
-            .child(div().min_w(0).truncate().font_family(monoF).text_color("#89b4fa").child(branch)))
-          .when(Boolean(modelTxt), (el) => el.child(div().min_w(0).truncate().text_color(t.dim).child(branch ? `· ${modelTxt}` : modelTxt)))))
+        .when(Boolean(ticket) || Boolean(modelTxt), (el) => el.child(h_flex().mt(2).gap(3).items_center().max_w(Math.max(petW + 22, cellW - 4)).text_size(9.5)
+          .when(Boolean(ticket), (el) => el.child(div().id(`tk-${a.address}`).flex_none().px(5).h(14).flex().items_center().rounded(3)
+            .bg("#89b4fa26").font_family(monoF).text_color("#89b4fa").cursor_pointer().hover((h) => h.bg("#89b4fa40"))
+            .tooltip(`Open ${ticket} in Jira`)
+            .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+            .on_click((_e, cx) => { cx.stop_propagation(); exec("open", [`${JIRA}/browse/${ticket}`]).catch(() => null); })
+            .child(ticket)))
+          .when(Boolean(modelTxt), (el) => el.child(div().min_w(0).truncate().text_color(t.dim).child(ticket ? `· ${modelTxt}` : modelTxt)))))
         .when(ctx != null && cellW >= 90, (el) => el.child(div().mt(2).max_w(Math.max(petW + 22, cellW - 4)).child(vitalsBars(t, ctx, `farm-vitals-${a.address}`, Math.max(petW + 22, cellW - 4)))));
     });
     // A dotted line of sparks between two desks that are about to clash.
