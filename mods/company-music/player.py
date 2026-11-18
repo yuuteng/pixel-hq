@@ -1004,7 +1004,7 @@ def launch_lyrics(url):
 def cmd_seek(seconds):
     """Restarts the current track's player at `seconds`; the queue and the rest of the state stay."""
     cur = read_state()
-    if not cur or not cur.get("pid") or not cur.get("url"):
+    if not cur or not cur.get("url") or not (cur.get("pid") or cur.get("status") == "paused"):
         return {"status": "error", "error": "Nothing is playing", "playing": False}
     dur = float(cur.get("duration") or 0)
     pos = max(0.0, min(float(seconds), dur - 1 if dur > 1 else float(seconds)))
@@ -1020,7 +1020,8 @@ def cmd_seek(seconds):
     player_bin = find_player_bin()
     if not player_bin:
         return {"status": "error", "error": "Neither ffplay nor mpv found. Install ffmpeg or mpv to enable playback.", "playing": False}
-    stop_process(cur["pid"], cur.get("status") == "paused")
+    if cur.get("pid"):
+        stop_process(cur["pid"])
     env = os.environ.copy()
     env["SDL_VIDEODRIVER"] = "dummy"
     try:
@@ -1030,6 +1031,7 @@ def cmd_seek(seconds):
         return {"status": "error", "error": f"Failed to start player process: {str(e)}", "playing": False}
     cur.update({"pid": proc.pid, "startTime": int(time.time()), "elapsed": int(pos), "currentElapsed": int(pos),
                 "status": "playing", "playing": True, "stream_url": stream})
+    cur.pop("pausedAt", None)
     cur.pop("position", None)
     write_state(cur)
     cur.update({"position": pos, "positionAt": time.time()})
@@ -1377,46 +1379,39 @@ def cmd_play(url, preset_title=None):
     return state
 
 def cmd_pause():
+    """Ends the player at its real position: a frozen (SIGSTOP) ffplay keeps looping its last audio buffer on macOS."""
     current = read_state()
     if not current or not current.get("pid"):
         return {"status": "idle", "playing": False, "title": "", "url": "", "elapsed": 0, "duration": 0, "currentElapsed": 0, "history": read_history()}
-    pid = current["pid"]
-    if not is_valid_player_proc(pid):
+    if not is_valid_player_proc(current["pid"]):
         clear_state()
         return {"status": "idle", "playing": False, "title": "", "url": "", "elapsed": 0, "duration": 0, "currentElapsed": 0, "history": read_history()}
-
-    suspend_process(pid)
-    now = int(time.time())
-    start = current.get("startTime", now)
-    current["elapsed"] = current.get("elapsed", 0) + max(0, now - start)
-    current["startTime"] = now
-    current["currentElapsed"] = current["elapsed"]
-    current["status"] = "paused"
-    current["playing"] = False
-    current["history"] = read_history()
+    pos = read_position()
+    kill_prefetch_worker()
+    stop_process(current["pid"])
+    if pos is None:
+        pos = float(current.get("elapsed", 0) + max(0, int(time.time()) - current.get("startTime", int(time.time()))))
     current.pop("position", None)
+    current.update({"pid": None, "pausedAt": pos, "elapsed": int(pos), "currentElapsed": int(pos), "startTime": int(time.time()),
+                    "status": "paused", "playing": False})
     write_state(current)
-    current.update({"position": read_position(), "positionAt": time.time(), "mode": read_mode()})
+    current.update({"position": pos, "positionAt": time.time(), "mode": read_mode(), "history": read_history()})
     return current
 
 def cmd_resume():
+    """Starts the player again from where Pause left it."""
     current = read_state()
-    if not current or not current.get("pid"):
-        return {"status": "idle", "playing": False, "title": "", "url": "", "elapsed": 0, "duration": 0, "currentElapsed": 0, "history": read_history()}
-    pid = current["pid"]
-    if not is_valid_player_proc(pid):
-        clear_state()
-        return {"status": "idle", "playing": False, "title": "", "url": "", "elapsed": 0, "duration": 0, "currentElapsed": 0, "history": read_history()}
-
-    resume_process(pid)
-    current["startTime"] = int(time.time())
-    current["status"] = "playing"
-    current["playing"] = True
-    current["history"] = read_history()
-    current.pop("position", None)
-    write_state(current)
-    current.update({"position": read_position(), "positionAt": time.time(), "mode": read_mode()})
-    return current
+    if not current or current.get("status") != "paused":
+        return cmd_status()
+    res = cmd_seek(float(current.get("pausedAt") or current.get("elapsed") or 0))
+    if res.get("status") != "error":
+        cur = read_state() or {}
+        cur.pop("pausedAt", None)
+        write_state(cur)
+        if read_queue():
+            launch_prefetch_worker()
+    res["mode"] = read_mode()
+    return res
 
 def cmd_stop():
     stop_all_players(keep_queue=False)
@@ -1424,6 +1419,9 @@ def cmd_stop():
 
 def cmd_status():
     current = read_state()
+    if current and current.get("status") == "paused" and not current.get("pid"):
+        current.update({"position": current.get("pausedAt"), "positionAt": time.time(), "mode": read_mode(), "history": read_history()})
+        return current
     if current and current.get("pid"):
         now = int(time.time())
         base = current.get("elapsed", 0)
