@@ -813,7 +813,6 @@ def cmd_play_queue_index(index):
         if err or not ext_stream:
             if index + 1 < len(queue["items"]):
                 return cmd_play_queue_index(index + 1)
-            clear_queue()
             clear_state()
             return {"status": "error", "error": err or "Failed to extract stream", "playing": False}
         stream_url = ext_stream
@@ -831,7 +830,6 @@ def cmd_play_queue_index(index):
 
     player_bin = find_player_bin()
     if not player_bin:
-        clear_queue()
         clear_state()
         return {"status": "error", "error": "Neither ffplay nor mpv found. Install ffmpeg or mpv to enable playback.", "playing": False}
 
@@ -849,7 +847,6 @@ def cmd_play_queue_index(index):
             start_new_session=True if sys.platform != "win32" else False
         )
     except Exception as e:
-        clear_queue()
         clear_state()
         return {"status": "error", "error": f"Failed to start player process: {str(e)}", "playing": False}
 
@@ -1192,10 +1189,65 @@ def update_history_title(url, title):
     if updated:
         write_history(current)
 
+def expand_queue(queue):
+    """Fills in a playlist queue that still holds only its first track."""
+    if not (queue.get("needs_expansion") and queue.get("playlist_url")):
+        return
+    full_items = extract_playlist_items(queue["playlist_url"], limit=500 if is_bilibili_url(queue["playlist_url"]) else 25)
+    if full_items:
+        cur_items = queue.get("items", [])
+        cur_id = cur_items[0]["id"] if cur_items else None
+        matched_idx = 0
+        if cur_id:
+            for idx, it in enumerate(full_items):
+                if it["id"] == cur_id:
+                    matched_idx = idx
+                    if cur_items:
+                        full_items[idx] = cur_items[0]
+                    break
+        queue["items"] = full_items + queue.get("extra", [])
+        queue["current_index"] = matched_idx
+    queue["needs_expansion"] = False
+    write_queue(queue)
+
+def play_in_queue(url, preset_title, queue):
+    """Plays a link while a queue exists: tracks the queue lacks go in after the current one, the queue stays."""
+    expand_queue(queue)
+    items = queue["items"]
+    single = not is_playlist_url(url)
+    if single:
+        direct = not is_extractor_url(url)
+        title = preset_title or (derive_direct_title(url) if direct else "YouTube Track")
+        add_history(url, title, "direct" if direct else "youtube")
+        wanted = [{"id": url, "title": title, "duration": 0, "url": url, "stream_url": url if direct else None, "resolved_at": int(time.time()) if direct else 0}]
+    else:
+        add_history(url, preset_title or "YouTube Playlist", "playlist")
+        wanted = extract_playlist_items(url, limit=500 if is_bilibili_url(url) else 200)
+        if not wanted:
+            return {"status": "error", "error": "Nothing to play from this link", "playing": False, "history": read_history()}
+    keys = lambda it: {k for k in (it.get("id"), it.get("url")) if k}
+    have = set().union(*(keys(it) for it in items))
+    at = queue.get("current_index", 0) + 1
+    new = [it for it in wanted if not (keys(it) & have)]
+    if new:
+        items[at:at] = new
+        queue.pop("played", None)
+        write_queue(queue)
+    index = next(i for i, it in enumerate(items) if keys(it) & keys(wanted[0]))
+    res = cmd_play_queue_index(index)
+    if single and res.get("status") == "playing":
+        update_history_title(url, re.sub(r"^\[\d+/\d+\] ", "", res.get("title") or ""))
+    res["history"] = read_history()
+    return res
+
 def cmd_play(url, preset_title=None):
     valid, res = validate_url(url)
     if not valid:
         return {"status": "error", "error": res, "playing": False, "history": read_history()}
+
+    queue = read_queue()
+    if queue and queue.get("items"):
+        return play_in_queue(res, preset_title, queue)
 
     if is_playlist_url(res):
         add_history(res, preset_title or "YouTube Playlist", "playlist")
@@ -1413,8 +1465,12 @@ def cmd_resume():
     res["mode"] = read_mode()
     return res
 
-def cmd_stop():
+def cmd_clear_queue():
     stop_all_players(keep_queue=False)
+    return {"status": "idle", "playing": False, "title": "", "url": "", "source": "direct", "elapsed": 0, "duration": 0, "currentElapsed": 0, "history": read_history()}
+
+def cmd_stop():
+    stop_all_players(keep_queue=True)
     return {"status": "idle", "playing": False, "title": "", "url": "", "source": "direct", "elapsed": 0, "duration": 0, "currentElapsed": 0, "history": read_history()}
 
 def cmd_status():
@@ -1458,15 +1514,13 @@ def cmd_status():
     failed = bool(current and int(time.time()) - int(current.get("startTime") or 0) < 5)
     queue = read_queue()
     if queue and queue.get("items"):
-        nxt = next_index(queue, auto=True)
+        nxt = next_index(queue, auto=True) if current else None
         if failed and nxt == queue.get("current_index", 0):
             nxt = nxt + 1 if nxt + 1 < len(queue["items"]) else None
         if nxt is not None:
             res = cmd_play_queue_index(nxt)
             res["history"] = read_history()
             return res
-        else:
-            clear_queue()
     elif current and current.get("url") and read_mode() in ("one", "loop") and not failed:
         res = cmd_play(current["url"], re.sub(r"^\[\d+/\d+\] ", "", current.get("title") or "") or None)
         res["history"] = read_history()
@@ -1496,23 +1550,7 @@ def cmd_status():
 def cmd_next():
     queue = read_queue()
     if queue and queue.get("items"):
-        if queue.get("needs_expansion") and queue.get("playlist_url"):
-            full_items = extract_playlist_items(queue["playlist_url"], limit=500 if is_bilibili_url(queue["playlist_url"]) else 25)
-            if full_items:
-                cur_items = queue.get("items", [])
-                cur_id = cur_items[0]["id"] if cur_items else None
-                matched_idx = 0
-                if cur_id:
-                    for idx, it in enumerate(full_items):
-                        if it["id"] == cur_id:
-                            matched_idx = idx
-                            if cur_items:
-                                full_items[idx] = cur_items[0]
-                            break
-                queue["items"] = full_items + queue.get("extra", [])
-                queue["current_index"] = matched_idx
-            queue["needs_expansion"] = False
-            write_queue(queue)
+        expand_queue(queue)
         nxt = next_index(queue, auto=False)
         return cmd_play_queue_index(nxt if nxt is not None else 0)
 
@@ -1529,23 +1567,7 @@ def cmd_next():
 def cmd_prev():
     queue = read_queue()
     if queue and queue.get("items"):
-        if queue.get("needs_expansion") and queue.get("playlist_url"):
-            full_items = extract_playlist_items(queue["playlist_url"], limit=500 if is_bilibili_url(queue["playlist_url"]) else 25)
-            if full_items:
-                cur_items = queue.get("items", [])
-                cur_id = cur_items[0]["id"] if cur_items else None
-                matched_idx = 0
-                if cur_id:
-                    for idx, it in enumerate(full_items):
-                        if it["id"] == cur_id:
-                            matched_idx = idx
-                            if cur_items:
-                                full_items[idx] = cur_items[0]
-                            break
-                queue["items"] = full_items + queue.get("extra", [])
-                queue["current_index"] = matched_idx
-            queue["needs_expansion"] = False
-            write_queue(queue)
+        expand_queue(queue)
         cur_idx = queue.get("current_index", 0)
         played = queue.get("played") or []
         if read_mode() == "shuffle" and len(played) > 1 and played[-1] == cur_idx:
@@ -1628,6 +1650,8 @@ def main():
         out = cmd_resume()
     elif action == "stop":
         out = cmd_stop()
+    elif action == "clear-queue":
+        out = cmd_clear_queue()
     elif action == "next":
         out = cmd_next()
     elif action == "prev":

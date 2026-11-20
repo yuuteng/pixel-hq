@@ -179,6 +179,16 @@ export default class CompanyMusic extends View {
     cx.notify();
   }
 
+  async clearQueue(cx) {
+    this.queue = null;
+    cx.notify();
+    const script = `${appHome()}/mods/company-music/player.py`;
+    const r = await exec("python3", [script, "clear-queue"], { timeout: 4000 }).catch(() => null);
+    try { setShared("pixel-hq.music", JSON.parse(r.stdout.trim().split("\n").pop())); } catch {}
+    this.loadQueue(cx);
+    cx.notify();
+  }
+
   queueList(t) {
     const q = this.queue;
     const items = q?.items ?? [];
@@ -189,12 +199,32 @@ export default class CompanyMusic extends View {
       .gap(4)
       .w_full()
       .child(
-        div()
-          .font_family(MONO)
-          .text_size(10)
-          .font_bold()
-          .text_color(t.dim)
-          .child(`${q?.name ? `${q.name} · ` : "PLAYLIST · "}${items.length}${q?.expanding ? "…" : ""} tracks`)
+        h_flex()
+          .w_full()
+          .items_center()
+          .justify_between()
+          .child(
+            div()
+              .font_family(MONO)
+              .text_size(10)
+              .font_bold()
+              .text_color(t.dim)
+              .child(`${q?.name ? `${q.name} · ` : "PLAYLIST · "}${items.length}${q?.expanding ? "…" : ""} tracks`)
+          )
+          .child(
+            div()
+              .id("queue-clear")
+              .cursor_pointer()
+              .px(6)
+              .py(1)
+              .rounded(3)
+              .text_size(9.5)
+              .font_family(MONO)
+              .text_color(t.dim)
+              .hover((s) => s.text_color("#f38ba8"))
+              .on_click((_e, cx) => this.clearQueue(cx))
+              .child("✕ Clear")
+          )
       )
       .child(
         v_flex()
@@ -1530,7 +1560,7 @@ export default class CompanyMusic extends View {
               )
           )
       )
-      .when((this.queue?.items?.length ?? 0) > 1 && (isPlaying || isPaused || isBuffering), (el) => el.child(this.queueList(t)))
+      .when((this.queue?.items?.length ?? 0) > 1, (el) => el.child(this.queueList(t)))
       .when(Boolean(this.history && this.history.length > 0), (el) =>
         el.child(
           v_flex()
