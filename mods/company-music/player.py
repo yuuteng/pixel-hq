@@ -1473,6 +1473,26 @@ def cmd_stop():
     stop_all_players(keep_queue=True)
     return {"status": "idle", "playing": False, "title": "", "url": "", "source": "direct", "elapsed": 0, "duration": 0, "currentElapsed": 0, "history": read_history()}
 
+def default_output_device():
+    """Current CoreAudio default output device id on macOS, None elsewhere or on failure."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        import ctypes
+        ca = ctypes.CDLL("/System/Library/Frameworks/CoreAudio.framework/CoreAudio")
+
+        class Addr(ctypes.Structure):
+            _fields_ = [("selector", ctypes.c_uint32), ("scope", ctypes.c_uint32), ("element", ctypes.c_uint32)]
+
+        fourcc = lambda s: int.from_bytes(s.encode(), "big")
+        addr = Addr(fourcc("dOut"), fourcc("glob"), 0)
+        dev = ctypes.c_uint32(0)
+        size = ctypes.c_uint32(ctypes.sizeof(dev))
+        err = ca.AudioObjectGetPropertyData(1, ctypes.byref(addr), 0, None, ctypes.byref(size), ctypes.byref(dev))
+        return dev.value if err == 0 and dev.value else None
+    except Exception:
+        return None
+
 def cmd_status():
     current = read_state()
     if current and current.get("status") == "paused" and not current.get("pid"):
@@ -1494,6 +1514,13 @@ def cmd_status():
         is_expired = is_playing and dur > 0 and current_elapsed >= dur + 1.5
 
         if proc_alive and not is_expired:
+            dev = default_output_device()
+            if dev is not None and is_playing:
+                if current.get("outputPid") != current["pid"]:
+                    current.update({"outputPid": current["pid"], "outputDevice": dev})
+                    write_state({k: v for k, v in current.items() if k not in ("history", "mode", "position", "positionAt")})
+                elif current.get("outputDevice") != dev:
+                    return cmd_pause()
             return current
 
         if is_playing and (now - current.get("startTime", now) < 6) and not is_expired:

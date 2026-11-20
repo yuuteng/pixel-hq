@@ -91,7 +91,7 @@ export default class CompanyMusic extends View {
           if (Array.isArray(res?.history)) {
             this.history = res.history;
           }
-          if (res.status === "playing" || res.status === "error" || res.status === "idle") {
+          if (res.status === "playing" || res.status === "paused" || res.status === "error" || res.status === "idle") {
             this.busy = false;
             setShared("pixel-hq.music", res);
             cx.notify();
