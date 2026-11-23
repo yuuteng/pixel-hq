@@ -1,5 +1,1 @@
-{
-  "version": "1.7.6",
-  "type": "urgent",
-  "notes": "Fix audio auto-advance, instant track start, and macOS playback"
-}
+{"version":"1.8.3","type":"normal","notes":"Desk activity: sub-agent interns, server rack, runners, living office wall; one-command Claude Code hook install"}

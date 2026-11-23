@@ -1,8 +1,102 @@
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, ScrollHandle } from "gpui-base";
-import { theme, run, shared, setShared, closeOverlay, checking, appHome, exec, window, props } from "herdr";
+import { theme, run, shared, setShared, closeOverlay, checking, appHome, exec, window, props, readTextFile, writeTextFile, settings } from "herdr";
 
 const MONO = "JetBrains Mono, Menlo, monospace";
+
+const notch = (c, [l, r, t, b]) => [
+  div().absolute().left(l + 2).right(r + 2).top(t).bottom(b).bg(c),
+  div().absolute().left(l).right(r).top(t + 2).bottom(b + 2).bg(c),
+];
+const box = (frame, fill, shadow) => [
+  ...notch(shadow, [2, 0, 2, 0]),
+  ...notch(frame, [0, 2, 0, 2]),
+  ...notch(fill, [2, 4, 2, 4]),
+];
+
+async function ensureMusicHotkey(cx) {
+  try {
+    if (cx && typeof cx.bind_keys === "function") {
+      cx.bind_keys([{ keystroke: "ctrl-shift-m", action: "mod.open:company-music" }]);
+    }
+  } catch {}
+  try {
+    const home = appHome();
+    if (!home) return;
+    const path = `${home}/keys.json`;
+    const raw = await readTextFile(path).catch(() => null);
+    if (!raw) return;
+    const parsed = JSON.parse(raw);
+    let changed = false;
+    if (parsed.global && parsed.global["ctrl-shift-m"] !== "mod.open:company-music") {
+      parsed.global["ctrl-shift-m"] = "mod.open:company-music";
+      changed = true;
+    }
+    if (parsed.terminal && parsed.terminal["ctrl-shift-m"] !== "mod.open:company-music") {
+      parsed.terminal["ctrl-shift-m"] = "mod.open:company-music";
+      changed = true;
+    }
+    if (changed) {
+      await writeTextFile(path, JSON.stringify(parsed, null, 2), raw);
+    }
+  } catch {}
+}
+
+async function syncSettingsVisibility(disabled) {
+  try {
+    const home = appHome();
+    if (!home) return;
+    const path = `${home}/settings.json`;
+    const raw = await readTextFile(path).catch(() => null);
+    if (!raw) return;
+    const parsed = JSON.parse(raw);
+    let changed = false;
+    if (disabled) {
+      if (parsed.musicbox !== false) {
+        parsed.musicbox = false;
+        changed = true;
+      }
+    } else {
+      if ("musicbox" in parsed) {
+        delete parsed.musicbox;
+        changed = true;
+      }
+    }
+    if (changed) {
+      await writeTextFile(path, JSON.stringify(parsed, null, 2), raw);
+    }
+  } catch {}
+}
+
+let detectedPythonBin = null;
+
+async function getPythonBin() {
+  if (detectedPythonBin) return detectedPythonBin;
+  const script = `${appHome()}/mods/company-music/player.py`;
+  const isWin = window()?.platform === "windows" || appHome().includes(":") || appHome().includes("\\");
+  const candidates = isWin ? ["python", "py", "python3"] : ["python3", "python"];
+  for (const bin of candidates) {
+    const r = await exec(bin, [script, "check"], { timeout: 4000 }).catch(() => null);
+    if (r?.stdout && r.stdout.includes('"status"')) {
+      detectedPythonBin = bin;
+      return bin;
+    }
+  }
+  detectedPythonBin = candidates[0];
+  return detectedPythonBin;
+}
+
+async function runPlayer(args, timeout = 15000) {
+  const bin = await getPythonBin();
+  const script = `${appHome()}/mods/company-music/player.py`;
+  const r = await exec(bin, [script, ...args], { timeout }).catch(() => null);
+  if (!r?.stdout) return null;
+  try {
+    return JSON.parse(r.stdout.trim().split("\n").pop());
+  } catch {
+    return null;
+  }
+}
 
 // Shown at once on Pause / Resume, before player.py answers: the real position frozen (or restarted) at the click.
 function flipPause(cur, pause) {
@@ -25,6 +119,19 @@ function formatTime(seconds) {
   return `${m.toString().padStart(2, "0")}:${rem.toString().padStart(2, "0")}`;
 }
 
+function isMusicBoxHidden() {
+  const sh = shared("pixel-hq.musicbox.hidden");
+  if (sh !== undefined && sh !== null) return Boolean(sh);
+  try {
+    if (localStorage.getItem("pixel-hq.musicbox.hidden") === "true") return true;
+  } catch {}
+  try {
+    const cfg = settings();
+    if (cfg?.musicbox === false || cfg?.music?.enabled === false || cfg?.["company-music"]?.enabled === false) return true;
+  } catch {}
+  return false;
+}
+
 const PRESETS = [
   { id: "somafm-chill", title: "SomaFM Groove Salad", desc: "Ambient & Downtempo", url: "https://ice2.somafm.com/groovesalad-128-mp3", tag: "Direct MP3" },
   { id: "nightwave", title: "Nightwave Plaza", desc: "Vaporwave & City Pop", url: "https://radio.plaza.one/mp3", tag: "Direct MP3" },
@@ -37,12 +144,19 @@ export default class CompanyMusic extends View {
     this.error = null;
     this.busy = false;
     this.depStatus = null;
+    cx.spawn(async (cx) => {
+      await ensureMusicHotkey(cx);
+    });
     this.showGuide = false;
     this.guideTab = window()?.platform === "windows" ? "windows" : window()?.platform === "macos" ? "macos" : "linux";
     this.installing = false;
     this.installMsg = null;
     this.installSuccess = null;
     this.history = shared("pixel-hq.music")?.history || [];
+    const curMusic = shared("pixel-hq.music");
+    if (curMusic?.error && curMusic.status !== "error") {
+      setShared("pixel-hq.music", { ...curMusic, error: null });
+    }
 
     this.urlInput = InputState.new({ placeholder: "Paste YouTube, SoundCloud, or direct audio stream URL..." });
     this.urlInput.on("submit", (_e, cx) => this.play(this.urlInput.value(), null, cx));
@@ -66,6 +180,7 @@ export default class CompanyMusic extends View {
     cx.timer.after(150, () => this.urlInput.focus());
     this.checkDeps(cx);
     this.loadHistory(cx);
+    this.syncStatus(cx);
 
     // The play queue of a playlist (YouTube list or Bilibili favorites): shown as a clickable track list.
     this.queue = null;
@@ -78,44 +193,36 @@ export default class CompanyMusic extends View {
       if (music?.playing) cx.notify();
     });
 
-    cx.timer.every(2000, async (cx) => {
+    cx.timer.every(2000, (cx) => {
       const music = shared("pixel-hq.music");
       if (music?.status !== "buffering" && !music?.playing) return;
-      const script = `${appHome()}/mods/company-music/player.py`;
-      const candidates = window()?.platform === "windows" ? ["pythonw", "python", "python3", "py"] : ["python3", "python"];
-      for (const bin of candidates) {
-        const r = await exec(bin, [script, "status"], { timeout: 15000 }).catch(() => null);
-        if (!r?.stdout) continue;
-        try {
-          const res = JSON.parse(r.stdout.trim().split("\n").pop());
-          if (Array.isArray(res?.history)) {
-            this.history = res.history;
-          }
-          if (res.status === "playing" || res.status === "paused" || res.status === "error" || res.status === "idle") {
-            this.busy = false;
-            setShared("pixel-hq.music", res);
-            cx.notify();
-          }
-          break;
-        } catch {}
-      }
+      this.syncStatus(cx);
     });
+  }
+
+  async syncStatus(cx) {
+    const res = await runPlayer(["status"], 15000);
+    if (!res) return;
+    if (Array.isArray(res.history)) {
+      this.history = res.history;
+    }
+    if (res.status === "playing" || res.status === "paused" || res.status === "error" || res.status === "idle") {
+      this.busy = false;
+    }
+    setShared("pixel-hq.music", res);
+    if (cx) cx.notify();
   }
 
   async loadQueue(cx) {
     if (this.queueLoading) return;
     this.queueLoading = true;
-    const script = `${appHome()}/mods/company-music/player.py`;
-    const r = await exec("python3", [script, "queue"], { timeout: 5000 }).catch(() => null);
+    const q = await runPlayer(["queue"], 5000);
     this.queueLoading = false;
-    if (!r?.stdout) return;
-    try {
-      const q = JSON.parse(r.stdout.trim().split("\n").pop());
-      if (q.mode && q.mode !== this.mode) { this.mode = q.mode; cx.notify(); }
-      if (JSON.stringify(q) === JSON.stringify(this.queue)) return;
-      this.queue = q;
-      cx.notify();
-    } catch {}
+    if (!q) return;
+    if (q.mode && q.mode !== this.mode) { this.mode = q.mode; cx.notify(); }
+    if (JSON.stringify(q) === JSON.stringify(this.queue)) return;
+    this.queue = q;
+    cx.notify();
   }
 
   async enqueue(url, cx) {
@@ -123,40 +230,30 @@ export default class CompanyMusic extends View {
     this.queueing = true;
     this.error = null;
     cx.notify();
-    const script = `${appHome()}/mods/company-music/player.py`;
-    const r = await exec("python3", [script, "enqueue", url.trim()], { timeout: 60000 }).catch(() => null);
+    const res = await runPlayer(["enqueue", url.trim()], 60000);
     this.queueing = false;
-    try {
-      const res = JSON.parse(r.stdout.trim().split("\n").pop());
-      if (res.status === "error") this.error = res.error;
-      else if (res.status === "ok") {
-        this.urlInput.set_value("");
-        this.queuedMsg = `+${res.added} ✓`;
-        cx.timer.after(2000, (cx) => { this.queuedMsg = null; cx.notify(); });
-      } else setShared("pixel-hq.music", res);
-    } catch {
-      this.error = "Could not add this link.";
-    }
+    if (!res) this.error = "Could not add this link.";
+    else if (res.status === "error") this.error = res.error;
+    else if (res.status === "ok") {
+      this.urlInput.set_value("");
+      this.queuedMsg = `+${res.added} ✓`;
+      cx.timer.after(2000, (cx) => { this.queuedMsg = null; cx.notify(); });
+    } else setShared("pixel-hq.music", res);
     this.loadQueue(cx);
     cx.notify();
   }
 
   async seek(seconds, cx) {
-    const script = `${appHome()}/mods/company-music/player.py`;
-    const r = await exec("python3", [script, "seek", seconds.toFixed(2)], { timeout: 30000 }).catch(() => null);
+    const res = await runPlayer(["seek", seconds.toFixed(2)], 30000);
     this.seekAt = null;
-    try {
-      const res = JSON.parse(r.stdout.trim().split("\n").pop());
-      if (res.status === "error") this.error = res.error;
-      else { this.error = null; setShared("pixel-hq.music", res); }
-    } catch {}
+    if (res?.status === "error") this.error = res.error;
+    else if (res) { this.error = null; setShared("pixel-hq.music", res); }
     cx.notify();
   }
 
   async cycleMode(cx) {
-    const script = `${appHome()}/mods/company-music/player.py`;
-    const r = await exec("python3", [script, "mode", "next"], { timeout: 5000 }).catch(() => null);
-    try { this.mode = JSON.parse(r.stdout.trim().split("\n").pop()).mode ?? this.mode; } catch {}
+    const res = await runPlayer(["mode", "next"], 5000);
+    this.mode = res?.mode ?? this.mode;
     cx.notify();
   }
 
@@ -167,14 +264,10 @@ export default class CompanyMusic extends View {
     const cur = shared("pixel-hq.music") ?? {};
     setShared("pixel-hq.music", { ...cur, playing: false, status: "buffering", title: this.queue?.items?.[index]?.title || "Buffering stream..." });
     cx.notify();
-    const script = `${appHome()}/mods/company-music/player.py`;
-    const r = await exec("python3", [script, "jump", String(index)], { timeout: 35000 }).catch(() => null);
+    const res = await runPlayer(["jump", String(index)], 35000);
     this.busy = false;
-    try {
-      const res = JSON.parse(r.stdout.trim().split("\n").pop());
-      if (res.status === "error") this.error = res.error;
-      else { this.error = null; setShared("pixel-hq.music", res); }
-    } catch {}
+    if (res?.status === "error") this.error = res.error;
+    else if (res) { this.error = null; setShared("pixel-hq.music", res); }
     this.loadQueue(cx);
     cx.notify();
   }
@@ -182,9 +275,8 @@ export default class CompanyMusic extends View {
   async clearQueue(cx) {
     this.queue = null;
     cx.notify();
-    const script = `${appHome()}/mods/company-music/player.py`;
-    const r = await exec("python3", [script, "clear-queue"], { timeout: 4000 }).catch(() => null);
-    try { setShared("pixel-hq.music", JSON.parse(r.stdout.trim().split("\n").pop())); } catch {}
+    const res = await runPlayer(["clear-queue"], 4000);
+    if (res) setShared("pixel-hq.music", res);
     this.loadQueue(cx);
     cx.notify();
   }
@@ -206,24 +298,27 @@ export default class CompanyMusic extends View {
           .child(
             div()
               .font_family(MONO)
-              .text_size(10)
+              .text_size(9.5)
               .font_bold()
               .text_color(t.dim)
-              .child(`${q?.name ? `${q.name} · ` : "PLAYLIST · "}${items.length}${q?.expanding ? "…" : ""} tracks`)
+              .child(`${q?.name ? `${q.name} · ` : "PLAYLIST · "}${items.length}${q?.expanding ? "…" : ""} TRACKS`)
           )
           .child(
             div()
               .id("queue-clear")
               .cursor_pointer()
-              .px(6)
+              .px(5)
               .py(1)
-              .rounded(3)
-              .text_size(9.5)
+              .bg("#313244")
+              .border_1()
+              .border_color("#45475a")
+              .text_size(9)
               .font_family(MONO)
-              .text_color(t.dim)
+              .font_bold()
+              .text_color("#a6adc8")
               .hover((s) => s.text_color("#f38ba8"))
               .on_click((_e, cx) => this.clearQueue(cx))
-              .child("✕ Clear")
+              .child("× CLEAR")
           )
       )
       .child(
@@ -245,56 +340,38 @@ export default class CompanyMusic extends View {
               .px(8)
               .gap(8)
               .items_center()
-              .rounded(5)
               .bg(on ? "#313244" : "#11111b")
               .border_1()
-              .border_color(on ? "#89b4fa" : "#11111b")
+              .border_color(on ? "#89b4fa" : "#313244")
               .cursor_pointer()
               .hover((s) => s.border_color("#89b4fa"))
               .tooltip(it.title)
               .on_click((_e, cx) => { if (!on) this.jump(i, cx); })
               .child(div().flex_none().w(24).text_size(10).font_family(MONO).text_color(on ? "#89b4fa" : t.dim).child(on ? "▶" : String(i + 1)))
-              .child(div().flex_1().min_w(0).truncate().text_size(11).font_semibold().text_color(on ? "#89b4fa" : t.foreground).child(it.title && it.title !== "NA" && it.title !== "YouTube Track" ? it.title : "…"))
-              .child(div().flex_none().text_size(10).font_family(MONO).text_color(t.dim).child(it.duration ? fmt(it.duration) : ""));
+              .child(div().flex_1().min_w(0).truncate().text_size(10.5).font_bold().text_color(on ? "#89b4fa" : t.foreground).child(it.title && it.title !== "NA" && it.title !== "YouTube Track" ? it.title : "…"))
+              .child(div().flex_none().text_size(9).font_family(MONO).text_color(t.dim).child(it.duration ? fmt(it.duration) : ""));
           }))
       );
   }
 
   async checkDeps(cx) {
-    const script = `${appHome()}/mods/company-music/player.py`;
-    const candidates = window()?.platform === "windows" ? ["pythonw", "python", "python3", "py"] : ["python3", "python"];
-    for (const bin of candidates) {
-      const r = await exec(bin, [script, "check"], { timeout: 4000 }).catch(() => null);
-      if (!r?.stdout) continue;
-      try {
-        const res = JSON.parse(r.stdout.trim().split("\n").pop());
-        this.depStatus = res;
-        this.showGuide = !res.has_player;
-        if (res.has_player) {
-          this.installing = false;
-          this.installMsg = null;
-          setShared("pixel-hq.music-setup", { installing: false, msg: null });
-        }
-        if (cx) cx.notify();
-        break;
-      } catch {}
+    const res = await runPlayer(["check"], 4000);
+    if (!res) return;
+    this.depStatus = res;
+    this.showGuide = !res.has_player;
+    if (res.has_player) {
+      this.installing = false;
+      this.installMsg = null;
+      setShared("pixel-hq.music-setup", { installing: false, msg: null });
     }
+    if (cx) cx.notify();
   }
 
   async loadHistory(cx) {
-    const script = `${appHome()}/mods/company-music/player.py`;
-    const candidates = window()?.platform === "windows" ? ["pythonw", "python", "python3", "py"] : ["python3", "python"];
-    for (const bin of candidates) {
-      const r = await exec(bin, [script, "history"], { timeout: 3000 }).catch(() => null);
-      if (!r?.stdout) continue;
-      try {
-        const res = JSON.parse(r.stdout.trim().split("\n").pop());
-        if (Array.isArray(res?.history)) {
-          this.history = res.history;
-          if (cx) cx.notify();
-        }
-        break;
-      } catch {}
+    const res = await runPlayer(["history"], 4000);
+    if (Array.isArray(res?.history)) {
+      this.history = res.history;
+      if (cx) cx.notify();
     }
   }
 
@@ -303,12 +380,7 @@ export default class CompanyMusic extends View {
     const cur = shared("pixel-hq.music") || {};
     setShared("pixel-hq.music", { ...cur, history: [] });
     if (cx) cx.notify();
-    const script = `${appHome()}/mods/company-music/player.py`;
-    const candidates = window()?.platform === "windows" ? ["pythonw", "python", "python3", "py"] : ["python3", "python"];
-    for (const bin of candidates) {
-      const r = await exec(bin, [script, "clear-history"], { timeout: 3000 }).catch(() => null);
-      if (r?.stdout) break;
-    }
+    await runPlayer(["clear-history"], 4000);
   }
 
   async openTerminal(targetOs, cx) {
@@ -511,143 +583,124 @@ export default class CompanyMusic extends View {
     this.busy = true;
     this.error = null;
 
+    const curMusic = shared("pixel-hq.music") || {};
+    const safeTitle = presetTitle ? presetTitle.replace(/["\r\n\\|]/g, " ").trim() : null;
+    const isExt = cleanUrl.includes("youtu") || cleanUrl.includes("soundcloud") || cleanUrl.includes("list=");
+    const finalTitle = isExt ? null : safeTitle;
+
     setShared("pixel-hq.music", {
+      ...curMusic,
       playing: false,
       status: "buffering",
-      title: presetTitle || "Buffering stream...",
+      title: safeTitle || "Buffering stream...",
       url: cleanUrl,
-      source: "direct"
+      error: null,
+      history: this.history && this.history.length > 0 ? this.history : (curMusic.history || [])
     });
     cx.notify();
 
-    const script = `${appHome()}/mods/company-music/player.py`;
-    const candidates = window()?.platform === "windows" ? ["pythonw", "python", "python3", "py"] : ["python3", "python"];
-    const args = presetTitle ? [script, "play", cleanUrl, presetTitle] : [script, "play", cleanUrl];
+    const args = finalTitle ? ["play", cleanUrl, finalTitle] : ["play", cleanUrl];
 
     let res = null;
-    for (const bin of candidates) {
-      const r = await exec(bin, args, { timeout: 35000 }).catch(() => null);
-      if (!r?.stdout) continue;
-      try {
-        res = JSON.parse(r.stdout.trim().split("\n").pop());
-        break;
-      } catch {}
-    }
+    try {
+      res = await runPlayer(args, 35000);
 
-    this.busy = false;
-    if (res?.status === "error") {
-      this.error = res.error;
-      setShared("pixel-hq.music", {
-        playing: false,
-        status: "error",
-        title: "",
-        url: cleanUrl,
-        error: res.error,
-        source: "direct"
-      });
-      if (res.error.includes("Neither ffplay nor mpv found")) {
-        this.showGuide = true;
-      }
-    } else if (res) {
-      this.error = null;
-      if (Array.isArray(res.history)) {
-        this.history = res.history;
+      if (res?.status === "error") {
+        this.error = res.error;
+        setShared("pixel-hq.music", {
+          ...curMusic,
+          playing: false,
+          status: "error",
+          title: "",
+          url: cleanUrl,
+          error: res.error,
+          source: "direct",
+          history: this.history && this.history.length > 0 ? this.history : (curMusic.history || [])
+        });
+        if (res.error.includes("Neither ffplay nor mpv found")) {
+          this.showGuide = true;
+        }
+      } else if (res) {
+        this.error = null;
+        if (Array.isArray(res.history)) {
+          this.history = res.history;
+        } else {
+          this.loadHistory(cx);
+        }
+        setShared("pixel-hq.music", {
+          ...res,
+          history: Array.isArray(res.history) ? res.history : (this.history || curMusic.history || [])
+        });
       } else {
-        this.loadHistory(cx);
+        this.error = "Could not start audio player. Verify Python, ffplay or mpv is installed.";
+        setShared("pixel-hq.music", {
+          ...curMusic,
+          playing: false,
+          status: "error",
+          title: "",
+          url: cleanUrl,
+          error: this.error,
+          source: "direct",
+          history: this.history && this.history.length > 0 ? this.history : (curMusic.history || [])
+        });
       }
-      setShared("pixel-hq.music", res);
-    } else {
-      this.error = "Could not start audio player. Verify Python, ffplay or mpv is installed.";
-      setShared("pixel-hq.music", {
-        playing: false,
-        status: "error",
-        title: "",
-        url: cleanUrl,
-        error: this.error,
-        source: "direct"
-      });
+    } finally {
+      this.busy = false;
+      if (cx) cx.notify();
     }
-    cx.notify();
   }
 
   async pause(cx) {
     setShared("pixel-hq.music", flipPause(shared("pixel-hq.music"), true));
     cx.notify();
-    const script = `${appHome()}/mods/company-music/player.py`;
-    const candidates = window()?.platform === "windows" ? ["pythonw", "python", "python3", "py"] : ["python3", "python"];
-    for (const bin of candidates) {
-      const r = await exec(bin, [script, "pause"], { timeout: 4000 }).catch(() => null);
-      if (!r?.stdout) continue;
-      try {
-        const res = JSON.parse(r.stdout.trim().split("\n").pop());
-        setShared("pixel-hq.music", res);
-        break;
-      } catch {}
-    }
+    const res = await runPlayer(["pause"], 4000);
+    if (res) setShared("pixel-hq.music", res);
     cx.notify();
   }
 
   async resume(cx) {
     setShared("pixel-hq.music", flipPause(shared("pixel-hq.music"), false));
     cx.notify();
-    const script = `${appHome()}/mods/company-music/player.py`;
-    const candidates = window()?.platform === "windows" ? ["pythonw", "python", "python3", "py"] : ["python3", "python"];
-    for (const bin of candidates) {
-      const r = await exec(bin, [script, "resume"], { timeout: 4000 }).catch(() => null);
-      if (!r?.stdout) continue;
-      try {
-        const res = JSON.parse(r.stdout.trim().split("\n").pop());
-        setShared("pixel-hq.music", res);
-        break;
-      } catch {}
-    }
+    const res = await runPlayer(["resume"], 35000);
+    if (res) setShared("pixel-hq.music", res);
     cx.notify();
   }
 
   async stop(cx) {
-    const script = `${appHome()}/mods/company-music/player.py`;
-    const candidates = window()?.platform === "windows" ? ["pythonw", "python", "python3", "py"] : ["python3", "python"];
-    for (const bin of candidates) {
-      const r = await exec(bin, [script, "stop"], { timeout: 4000 }).catch(() => null);
-      if (!r?.stdout) continue;
-      try {
-        const res = JSON.parse(r.stdout.trim().split("\n").pop());
-        setShared("pixel-hq.music", res);
-        break;
-      } catch {}
+    if (this.actionBusy) return;
+    this.actionBusy = true;
+    try {
+      const res = await runPlayer(["stop"], 4000);
+      if (res) setShared("pixel-hq.music", res);
+      this.error = null;
+      if (cx) cx.notify();
+    } finally {
+      this.actionBusy = false;
     }
-    this.error = null;
-    cx.notify();
   }
 
   async next(cx) {
-    const script = `${appHome()}/mods/company-music/player.py`;
-    const candidates = window()?.platform === "windows" ? ["pythonw", "python", "python3", "py"] : ["python3", "python"];
-    for (const bin of candidates) {
-      const r = await exec(bin, [script, "next"], { timeout: 15000 }).catch(() => null);
-      if (!r?.stdout) continue;
-      try {
-        const res = JSON.parse(r.stdout.trim().split("\n").pop());
-        setShared("pixel-hq.music", res);
-        break;
-      } catch {}
+    if (this.actionBusy) return;
+    this.actionBusy = true;
+    try {
+      const res = await runPlayer(["next"], 20000);
+      if (res) setShared("pixel-hq.music", res);
+      if (cx) cx.notify();
+    } finally {
+      this.actionBusy = false;
     }
-    if (cx) cx.notify();
   }
 
   async prev(cx) {
-    const script = `${appHome()}/mods/company-music/player.py`;
-    const candidates = window()?.platform === "windows" ? ["pythonw", "python", "python3", "py"] : ["python3", "python"];
-    for (const bin of candidates) {
-      const r = await exec(bin, [script, "prev"], { timeout: 15000 }).catch(() => null);
-      if (!r?.stdout) continue;
-      try {
-        const res = JSON.parse(r.stdout.trim().split("\n").pop());
-        setShared("pixel-hq.music", res);
-        break;
-      } catch {}
+    if (this.actionBusy) return;
+    this.actionBusy = true;
+    try {
+      const res = await runPlayer(["prev"], 20000);
+      if (res) setShared("pixel-hq.music", res);
+      if (cx) cx.notify();
+    } finally {
+      this.actionBusy = false;
     }
-    if (cx) cx.notify();
   }
 
   renderSetupGuide(t) {
@@ -672,19 +725,14 @@ export default class CompanyMusic extends View {
 
     const copyBtn = (cmd, label) => {
       const isCopied = this.copiedCmd === cmd;
-      return div()
-        .cursor_pointer()
+      return h_flex()
+        .relative()
+        .h(22)
         .px(8)
-        .py(3)
-        .rounded(4)
-        .bg(isCopied ? "#a6e3a133" : "#313244")
-        .border_1()
-        .border_color(isCopied ? "#a6e3a1" : "#45475a")
-        .text_size(10)
-        .font_family(MONO)
-        .font_semibold()
-        .text_color(isCopied ? "#a6e3a1" : "#cdd6f4")
-        .hover((s) => s.bg(isCopied ? "#a6e3a144" : "#45475a"))
+        .items_center()
+        .children(box(isCopied ? "#a6e3a1" : "#45475a", isCopied ? "#a6e3a122" : "#313244", "#11111b"))
+        .cursor_pointer()
+        .hover((s) => s.text_color("#ffffff"))
         .on_click((_e, cx) => {
           cx.write_to_clipboard(cmd);
           this.copiedCmd = cmd;
@@ -696,7 +744,14 @@ export default class CompanyMusic extends View {
             }
           });
         })
-        .child(isCopied ? "✓ Copied" : label || "Copy");
+        .child(
+          div()
+            .font_family(MONO)
+            .font_bold()
+            .text_size(9)
+            .text_color(isCopied ? "#a6e3a1" : "#cdd6f4")
+            .child(isCopied ? "COPIED" : label || "COPY"),
+        );
     };
 
     const cmdBox = (cmd) =>
@@ -705,7 +760,6 @@ export default class CompanyMusic extends View {
         .items_center()
         .justify_between()
         .p(6)
-        .rounded(6)
         .bg("#181825")
         .border_1()
         .border_color("#45475a")
@@ -721,43 +775,61 @@ export default class CompanyMusic extends View {
         }
       })
       .size_full()
-      .bg("#181825")
-      .border_1()
-      .border_color("#45475a")
-      .rounded(12)
-      .p(16)
-      .gap(12)
-      .text_color(t.foreground)
+      .min_h(0)
+      .relative()
+      .children(box("#45475a", "#181825", "#11111b"))
       .child(
-        h_flex()
-          .w_full()
-          .items_center()
-          .justify_between()
+        v_flex()
+          .relative()
+          .size_full()
+          .p(12)
+          .gap(10)
+          .font_family(MONO)
+          .text_color(t.foreground)
           .child(
-            v_flex()
-              .gap(2)
-              .child(div().font_bold().text_size(14).text_color("#cdd6f4").child("How to Install Audio Player"))
-              .child(div().text_size(11).text_color(t.dim).child("FFplay or MPV engine is required to stream audio without a browser"))
+            h_flex()
+              .w_full()
+              .pb(6)
+              .border_b(1)
+              .border_color("#313244")
+              .items_center()
+              .justify_between()
+              .child(
+                h_flex()
+                  .gap(8)
+                  .items_center()
+                  .child(svg("mods/company-status/boombox.svg").size(15))
+                  .child(
+                    v_flex()
+                      .gap(1)
+                      .child(div().font_family(MONO).font_bold().text_size(12).text_color("#cdd6f4").child("AUDIO ENGINE SETUP"))
+                      .child(div().text_size(9.5).text_color(t.dim).child("FFplay or MPV required for native audio streaming"))
+                  )
+              )
+              .child(
+                h_flex()
+                  .relative()
+                  .h(22)
+                  .px(8)
+                  .items_center()
+                  .cursor_pointer()
+                  .children(box("#45475a", "#313244", "#11111b"))
+                  .hover((s) => s.text_color("#ffffff"))
+                  .on_click(() => closeOverlay(props()?.overlay))
+                  .child(
+                    div()
+                      .text_size(9.5)
+                      .font_bold()
+                      .font_family(MONO)
+                      .text_color("#a6adc8")
+                      .child("ESC"),
+                  ),
+              ),
           )
-          .child(
-            div()
-              .cursor_pointer()
-              .px(7)
-              .py(2)
-              .rounded(4)
-              .text_size(11)
-              .font_family(MONO)
-              .text_color(t.dim)
-              .hover((s) => s.bg(t.hover).text_color(t.foreground))
-              .on_click(() => closeOverlay(props()?.overlay))
-              .child("✕ Close")
-          )
-      )
       .child(
         h_flex()
           .w_full()
           .p(3)
-          .rounded(8)
           .bg("#11111b")
           .border_1()
           .border_color("#313244")
@@ -768,7 +840,6 @@ export default class CompanyMusic extends View {
               .h(28)
               .items_center()
               .justify_center()
-              .rounded(6)
               .when(isMac, (el) => el.bg("#313244").border_1().border_color("#cba6f7"))
               .cursor_pointer()
               .text_size(11)
@@ -786,7 +857,6 @@ export default class CompanyMusic extends View {
               .h(28)
               .items_center()
               .justify_center()
-              .rounded(6)
               .when(isWindows, (el) => el.bg("#313244").border_1().border_color("#89b4fa"))
               .cursor_pointer()
               .text_size(11)
@@ -804,7 +874,6 @@ export default class CompanyMusic extends View {
               .h(28)
               .items_center()
               .justify_center()
-              .rounded(6)
               .when(isLinux, (el) => el.bg("#313244").border_1().border_color("#a6e3a1"))
               .cursor_pointer()
               .text_size(11)
@@ -822,7 +891,6 @@ export default class CompanyMusic extends View {
           .w_full()
           .flex_1()
           .p(12)
-          .rounded(8)
           .bg("#11111b")
           .border_1()
           .border_color("#313244")
@@ -891,7 +959,6 @@ export default class CompanyMusic extends View {
                 .w_full()
                 .px(10)
                 .py(6)
-                .rounded(6)
                 .bg("#f9e2af22")
                 .border_1()
                 .border_color("#f9e2af44")
@@ -914,7 +981,6 @@ export default class CompanyMusic extends View {
                     div()
                       .h(28)
                       .px(10)
-                      .rounded(6)
                       .when(isCurrentOsTab, (el) =>
                         el
                           .bg(isInstalling ? "#45475a" : "#89b4fa")
@@ -941,7 +1007,6 @@ export default class CompanyMusic extends View {
                     div()
                       .h(28)
                       .px(9)
-                      .rounded(6)
                       .when(isCurrentOsTab, (el) =>
                         el
                           .bg("#313244")
@@ -969,7 +1034,6 @@ export default class CompanyMusic extends View {
                     div()
                       .h(28)
                       .px(9)
-                      .rounded(6)
                       .bg("#313244")
                       .border_1()
                       .border_color("#45475a")
@@ -989,7 +1053,8 @@ export default class CompanyMusic extends View {
                   .cursor_pointer()
                   .px(6)
                   .py(4)
-                  .rounded(4)
+                  .border_1()
+                  .border_color("#313244")
                   .text_size(10.5)
                   .font_family(MONO)
                   .text_color(t.dim)
@@ -1001,7 +1066,8 @@ export default class CompanyMusic extends View {
                   .child("Skip →")
               )
           )
-      );
+      )
+  );
   }
 
   render() {
@@ -1017,10 +1083,12 @@ export default class CompanyMusic extends View {
     const currentTitle = music.title || (isPlaying ? "Audio Stream" : "No stream playing");
 
     const nowSec = Math.floor(Date.now() / 1000);
-    const baseElapsed = Number(music.elapsed || music.currentElapsed || 0);
+    const pauseElapsed = Number(music.elapsed || 0);
     // ffplay's own clock (player.py `position`), advanced from when it was read; the start-time count only without it.
     const realPos = typeof music.position === "number" ? music.position + (isPlaying && music.positionAt ? Math.max(0, Date.now() / 1000 - music.positionAt) : 0) : null;
-    const counted = isPlaying && music.startTime ? baseElapsed + Math.max(0, nowSec - music.startTime) : (music.currentElapsed || baseElapsed);
+    const counted = isPlaying && music.startTime
+      ? pauseElapsed + Math.max(0, nowSec - music.startTime)
+      : Number(music.currentElapsed || pauseElapsed);
     const dur = Number(music.duration || 0);
     const liveElapsed = this.seekAt != null ? this.seekAt : Math.min(dur > 0 ? dur : Infinity, realPos ?? counted);
     const percent = dur > 0 ? Math.min(100, Math.max(0, Math.round((liveElapsed / dur) * 100))) : 0;
@@ -1031,6 +1099,7 @@ export default class CompanyMusic extends View {
     const isStalePlayerError = Boolean(this.depStatus?.has_player && rawError && rawError.includes("Neither ffplay nor mpv"));
     const isStaleYtDlpError = Boolean(this.depStatus?.has_ytdlp && rawError && rawError.includes("yt-dlp"));
     const activeError = (isStalePlayerError || isStaleYtDlpError) ? null : rawError;
+    const isMusicHidden = isMusicBoxHidden();
 
     return v_flex()
       .track_focus(this.handle)
@@ -1041,6 +1110,7 @@ export default class CompanyMusic extends View {
         }
       })
       .size_full()
+      .min_h(0)
       .on_mouse_move((e, cx) => {
         if (this.seekAt == null || !this.barW) return;
         this.seekAt = Math.max(0, Math.min(1, (e.position.x - this.barLeft) / this.barW)) * this.seekDur;
@@ -1050,73 +1120,140 @@ export default class CompanyMusic extends View {
         if (this.seekAt == null) return;
         this.seek(this.seekAt, cx);
       })
-      .bg("#181825")
-      .border_1()
-      .border_color("#45475a")
-      .rounded(12)
-      .p(16)
-      .gap(12)
-      .text_color(t.foreground)
+      .relative()
+      .children(box("#45475a", "#181825", "#11111b"))
       .child(
-        h_flex()
-          .w_full()
-          .items_center()
-          .justify_between()
+        v_flex()
+          .relative()
+          .size_full()
+          .p(12)
+          .gap(8)
+          .font_family(MONO)
+          .text_color(t.foreground)
           .child(
             h_flex()
-              .gap(8)
+              .w_full()
+              .pb(6)
+              .border_b(1)
+              .border_color("#313244")
               .items_center()
-              .child(div().font_family(MONO).font_bold().text_size(13).text_color("#89b4fa").child("PIXEL MUSICBOX"))
+              .justify_between()
               .child(
-                div()
-                  .px(6)
-                  .py(1)
-                  .rounded(4)
-                  .bg("#313244")
-                  .text_size(9.5)
-                  .font_family(MONO)
-                  .text_color("#a6adc8")
-                  .child("AUDIO ONLY")
+                h_flex()
+                  .gap(8)
+                  .items_center()
+                  .child(svg("mods/company-status/boombox.svg").size(15))
+                  .child(div().font_family(MONO).font_bold().text_size(12).text_color("#89b4fa").child("PIXEL MUSICBOX"))
+                  .child(
+                    div()
+                      .px(5)
+                      .py(1)
+                      .bg("#313244")
+                      .border_1()
+                      .border_color("#45475a")
+                      .text_size(9)
+                      .font_family(MONO)
+                      .text_color("#a6adc8")
+                      .child("AUDIO ONLY")
+                  )
+                  .when(missingPlayer, (el) =>
+                    el.child(
+                      div()
+                        .px(5)
+                        .py(1)
+                        .bg("#f38ba833")
+                        .border_1()
+                        .border_color("#f38ba866")
+                        .text_size(9)
+                        .font_family(MONO)
+                        .text_color("#f38ba8")
+                        .cursor_pointer()
+                        .hover((s) => s.bg("#f38ba855"))
+                        .on_click((_e, cx) => {
+                          this.showGuide = true;
+                          cx.notify();
+                        })
+                        .child("⚠️ SETUP GUIDE")
+                    )
+                  )
               )
-              .when(missingPlayer, (el) =>
-                el.child(
-                  div()
-                    .px(6)
-                    .py(1)
-                    .rounded(4)
-                    .bg("#f38ba833")
-                    .border_1()
-                    .border_color("#f38ba866")
-                    .text_size(9.5)
-                    .font_family(MONO)
-                    .text_color("#f38ba8")
-                    .cursor_pointer()
-                    .hover((s) => s.bg("#f38ba855"))
-                    .on_click((_e, cx) => {
-                      this.showGuide = true;
-                      cx.notify();
-                    })
-                    .child("⚠️ Setup Guide")
-                )
+              .child(
+                h_flex()
+                  .gap(6)
+                  .items_center()
+                  .child(
+                    div()
+                      .id("btn-toggle-status-bar")
+                      .cursor_pointer()
+                      .px(6)
+                      .py(2)
+                      .border_1()
+                      .border_color("#45475a")
+                      .text_size(9.5)
+                      .font_family(MONO)
+                      .font_bold()
+                      .bg(isMusicHidden ? "#45475a" : "#313244")
+                      .text_color(isMusicHidden ? "#f9e2af" : t.dim)
+                      .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                      .tooltip(isMusicHidden ? "Show on status bar" : "Hide MusicBox from status bar")
+                      .on_click((_e, cx) => {
+                        const nextVal = !isMusicBoxHidden();
+                        try {
+                          if (nextVal) {
+                            localStorage.setItem("pixel-hq.musicbox.hidden", "true");
+                          } else {
+                            localStorage.removeItem("pixel-hq.musicbox.hidden");
+                          }
+                        } catch {}
+                        setShared("pixel-hq.musicbox.hidden", nextVal);
+                        cx.spawn(async () => {
+                          await syncSettingsVisibility(nextVal);
+                        });
+                        cx.notify();
+                      })
+                      .child(isMusicHidden ? "STATUS: HIDDEN" : "STATUS: SHOWN")
+                  )
+                  .child(
+                    h_flex()
+                      .relative()
+                      .h(22)
+                      .px(8)
+                      .pt(2)
+                      .pb(4)
+                      .items_center()
+                      .cursor_pointer()
+                      .children(box("#45475a", "#313244", "#11111b"))
+                      .hover((s) => s.text_color("#ffffff"))
+                      .on_click(() => closeOverlay(props()?.overlay))
+                      .child(
+                        div()
+                          .text_size(9.5)
+                          .font_family(MONO)
+                          .font_bold()
+                          .text_color("#a6adc8")
+                          .child("ESC"),
+                      ),
+                  )
               )
           )
-          .child(
-            div()
-              .cursor_pointer()
-              .px(7)
-              .py(2)
-              .rounded(4)
-              .text_size(11)
-              .font_family(MONO)
-              .text_color(t.dim)
-              .hover((s) => s.bg(t.hover).text_color(t.foreground))
-              .on_click(() => closeOverlay(props()?.overlay))
-              .child("✕ Close")
-          )
+      .when(isMusicHidden, (el) =>
+        el.child(
+          h_flex()
+            .w_full()
+            .px(8)
+            .py(3)
+            .bg("#f9e2af15")
+            .border_1()
+            .border_color("#f9e2af33")
+            .items_center()
+            .gap(6)
+            .child(div().text_size(10).child("💡"))
+            .child(div().text_size(9.5).text_color("#f9e2af").child("MusicBox hidden from status bar. Reopen with Ctrl + Shift + M"))
+        )
       )
       .child(
         v_flex()
-          .gap(6)
+          .gap(5)
           .w_full()
           .child(
             h_flex()
@@ -1126,50 +1263,55 @@ export default class CompanyMusic extends View {
               .child(
                 div()
                   .flex_1()
-                  .h(30)
-                  .px(8)
+                  .h(28)
+                  .px(7)
                   .flex()
                   .items_center()
-                  .rounded(6)
                   .bg("#11111b")
                   .border_1()
                   .border_color("#313244")
-                  .child(Input.new(this.urlInput).font_family(MONO).text_size(11.5).size_full().text_color(t.foreground))
+                  .child(Input.new(this.urlInput).font_family(MONO).text_size(11).size_full().text_color(t.foreground))
               )
               .child(
-                div()
+                h_flex()
                   .id("btn-play-custom")
-                  .h(30)
-                  .px(12)
-                  .rounded(6)
-                  .bg(this.busy ? "#45475a" : "#89b4fa")
-                  .cursor_pointer()
-                  .flex()
+                  .relative()
+                  .h(28)
+                  .px(10)
                   .items_center()
-                  .font_bold()
-                  .text_size(11)
-                  .text_color(this.busy ? "#cdd6f4" : "#11111b")
+                  .cursor_pointer()
+                  .children(box(this.busy ? "#45475a" : "#89b4fa", this.busy ? "#313244" : "#89b4fa", "#11111b"))
                   .hover((s) => s.opacity(0.88))
                   .on_click((_e, cx) => this.play(this.urlInput.value(), null, cx))
-                  .child(this.busy ? "⏳ Starting..." : "▶ Play")
+                  .child(
+                    div()
+                      .font_bold()
+                      .font_family(MONO)
+                      .text_size(10)
+                      .text_color(this.busy ? "#cdd6f4" : "#11111b")
+                      .child(this.busy ? "STARTING..." : "▶ PLAY"),
+                  ),
               )
               .child(
-                div()
+                h_flex()
                   .id("btn-enqueue")
-                  .h(30)
+                  .relative()
+                  .h(28)
                   .px(10)
-                  .rounded(6)
-                  .bg("#313244")
-                  .cursor_pointer()
-                  .flex()
                   .items_center()
-                  .font_bold()
-                  .text_size(11)
-                  .text_color(this.queueing ? "#6c7086" : "#cdd6f4")
-                  .hover((s) => s.bg("#45475a"))
+                  .cursor_pointer()
+                  .children(box("#45475a", "#313244", "#11111b"))
+                  .hover((s) => s.opacity(0.88))
                   .tooltip("Add to the end of the current list")
                   .on_click((_e, cx) => this.enqueue(this.urlInput.value(), cx))
-                  .child(this.queueing ? "⏳ Adding..." : this.queuedMsg || "+ Queue")
+                  .child(
+                    div()
+                      .font_bold()
+                      .font_family(MONO)
+                      .text_size(10)
+                      .text_color(this.queueing ? "#6c7086" : "#cdd6f4")
+                      .child(this.queueing ? "ADDING..." : this.queuedMsg || "+ QUEUE"),
+                  ),
               )
           )
       )
@@ -1177,25 +1319,23 @@ export default class CompanyMusic extends View {
         el.child(
           h_flex()
             .w_full()
-            .px(10)
-            .py(7)
-            .rounded(6)
+            .px(8)
+            .py(5)
             .bg("#a6e3a122")
             .border_1()
             .border_color("#a6e3a155")
             .gap(6)
             .items_center()
-            .child(div().text_size(11).child("✓"))
-            .child(div().font_bold().text_size(10.5).text_color("#a6e3a1").child(this.installSuccess))
+            .child(div().text_size(10).child("✓"))
+            .child(div().font_bold().text_size(10).text_color("#a6e3a1").child(this.installSuccess))
         )
       )
       .when(Boolean(activeError || this.installing), (el) =>
         el.child(
           v_flex()
             .w_full()
-            .px(10)
-            .py(8)
-            .rounded(6)
+            .px(8)
+            .py(6)
             .bg(this.installing ? "#f9e2af1a" : "#f38ba822")
             .border_1()
             .border_color(this.installing ? "#f9e2af44" : "#f38ba855")
@@ -1204,40 +1344,38 @@ export default class CompanyMusic extends View {
               h_flex()
                 .gap(6)
                 .items_center()
-                .child(div().text_size(11).child(this.installing ? "⏳" : "⚠️"))
-                .child(div().font_bold().text_size(11).text_color(this.installing ? "#f9e2af" : "#f38ba8").child(this.installing ? "Installing Audio Extractor..." : "Audio Player Error"))
+                .child(div().text_size(10).child(this.installing ? "⏳" : "⚠️"))
+                .child(div().font_bold().text_size(10.5).text_color(this.installing ? "#f9e2af" : "#f38ba8").child(this.installing ? "INSTALLING AUDIO EXTRACTOR..." : "AUDIO PLAYER ERROR"))
                 .child(div().flex_1())
                 .when(Boolean((activeError && activeError.includes("yt-dlp")) || this.installing), (headEl) =>
                   headEl.child(
                     div()
                       .when(this.installing, (b) =>
                         b
-                          .px(7)
-                          .py(2)
-                          .rounded(3)
+                          .px(6)
+                          .py(1)
                           .bg("#313244")
                           .border_1()
                           .border_color("#45475a")
-                          .text_size(10)
-                          .font_semibold()
+                          .text_size(9.5)
+                          .font_bold()
                           .text_color("#f9e2af")
-                          .child("⏳ Installing yt-dlp...")
+                          .child("INSTALLING...")
                       )
                       .when(!this.installing, (b) =>
                         b
                           .cursor_pointer()
                           .px(6)
                           .py(1)
-                          .rounded(3)
                           .bg("#89b4fa22")
                           .border_1()
                           .border_color("#89b4fa55")
-                          .text_size(10)
-                          .font_semibold()
+                          .text_size(9.5)
+                          .font_bold()
                           .text_color("#89b4fa")
                           .hover((s) => s.bg("#89b4fa44"))
                           .on_click((_e, cx) => this.installYtDlpOnly(cx))
-                          .child("⚡ Install yt-dlp")
+                          .child("⚡ INSTALL YT-DLP")
                       )
                   )
                 )
@@ -1247,17 +1385,18 @@ export default class CompanyMusic extends View {
                       .cursor_pointer()
                       .px(6)
                       .py(1)
-                      .rounded(3)
                       .bg("#f38ba833")
-                      .text_size(10)
-                      .font_semibold()
+                      .border_1()
+                      .border_color("#f38ba866")
+                      .text_size(9.5)
+                      .font_bold()
                       .text_color("#f38ba8")
                       .hover((s) => s.bg("#f38ba855"))
                       .on_click((_e, cx) => {
                         this.showGuide = true;
                         cx.notify();
                       })
-                      .child("View Setup Guide →")
+                      .child("SETUP GUIDE →")
                   )
                 )
             )
@@ -1266,23 +1405,22 @@ export default class CompanyMusic extends View {
                 h_flex()
                   .gap(6)
                   .items_center()
-                  .child(div().text_size(10.5).font_medium().text_color("#f9e2af").child(this.installMsg || "Installing yt-dlp via pip (~3s)... Please wait"))
+                  .child(div().text_size(10).text_color("#f9e2af").child(this.installMsg || "Installing yt-dlp via pip (~3s)... Please wait"))
               )
             )
             .when(!this.installing, (bodyEl) =>
-              bodyEl.child(div().text_size(10.5).text_color("#eba0ac").child(activeError || ""))
+              bodyEl.child(div().text_size(10).text_color("#eba0ac").child(activeError || ""))
             )
         )
       )
       .child(
         v_flex()
           .w_full()
-          .p(10)
-          .rounded(8)
-          .bg("#11111b")
+          .p(8)
+          .bg("#0a0e14")
           .border_1()
-          .border_color("#313244")
-          .gap(8)
+          .border_color("#24273a")
+          .gap(6)
           .child(
             h_flex()
               .w_full()
@@ -1290,38 +1428,42 @@ export default class CompanyMusic extends View {
               .justify_between()
               .child(
                 h_flex()
-                  .flex_1()
-                  .min_w(0)
-                  .gap(8)
+                  .gap(6)
                   .items_center()
-                  .child(div().flex_none().text_size(14).child("📻"))
                   .child(
-                    v_flex()
-                      .flex_1()
-                      .min_w(0)
-                      .gap(2)
-                      .child(div().text_size(9.5).font_family(MONO).text_color(t.dim).child("NOW PLAYING"))
-                      .child(div().font_bold().text_size(12).text_color(t.foreground).truncate().child(currentTitle))
+                    div()
+                      .font_family(MONO)
+                      .text_size(10)
+                      .font_bold()
+                      .text_color("#585b70")
+                      .child("(◎) ══════════ (◎)")
                   )
               )
               .child(
                 div()
-                  .flex_none()
-                  .ml(8)
-                  .px(7)
-                  .py(2)
-                  .rounded(4)
-                  .text_size(9.5)
+                  .px(6)
+                  .py(1)
+                  .border_1()
+                  .border_color(
+                    isPlaying
+                      ? "#a6e3a1"
+                      : isBuffering
+                      ? "#f9e2af"
+                      : isPaused
+                      ? "#cba6f7"
+                      : "#313244"
+                  )
+                  .text_size(8.5)
                   .font_family(MONO)
                   .font_bold()
                   .bg(
                     isPlaying
-                      ? "#a6e3a133"
+                      ? "#a6e3a122"
                       : isBuffering
-                      ? "#f9e2af33"
+                      ? "#f9e2af22"
                       : isPaused
-                      ? "#cba6f733"
-                      : "#313244"
+                      ? "#cba6f722"
+                      : "#181825"
                   )
                   .text_color(
                     isPlaying
@@ -1334,229 +1476,225 @@ export default class CompanyMusic extends View {
                   )
                   .child(
                     isPlaying
-                      ? "● PLAYING"
+                      ? "● PLAYING [STEREO]"
                       : isBuffering
-                      ? "⏳ BUFFERING"
+                      ? "⏳ BUFFERING..."
                       : isPaused
                       ? "⏸ PAUSED"
-                      : "IDLE"
+                      : "■ STANDBY"
                   )
               )
           )
-          .when(isPlaying || isPaused || isBuffering, (el) =>
-            el.child(
-              v_flex()
-                .w_full()
-                .gap(5)
-                .when(dur > 0, (bar) =>
-                  bar.child(
+          .child(
+            v_flex()
+              .w_full()
+              .gap(1)
+              .child(div().text_size(8.5).font_bold().font_family(MONO).text_color(isPlaying ? "#a6e3a1" : t.dim).child("AUDIO OUTPUT // DECK A"))
+              .child(div().font_bold().font_family(MONO).text_size(11.5).text_color(isPlaying ? "#a6e3a1" : "#cdd6f4").truncate().child(currentTitle))
+          )
+          .child(
+            v_flex()
+              .w_full()
+              .gap(4)
+              .child(
+                div()
+                  .id("seek-bar")
+                  .w_full()
+                  .h(12)
+                  .flex()
+                  .items_center()
+                  .when(dur > 0, (bar) => bar
+                    .cursor_pointer()
+                    .tooltip("Click or drag to jump")
+                    .on_size_change((size) => { this.barW = size.width; })
+                    .on_mouse_down("left", (e, cx) => {
+                      if (!this.barW || !e.local_position) return;
+                      cx.stop_propagation();
+                      this.barLeft = e.position.x - e.local_position.x;
+                      this.seekDur = dur;
+                      this.seekAt = Math.max(0, Math.min(1, e.local_position.x / this.barW)) * dur;
+                      cx.notify();
+                    }))
+                  .child(
                     div()
-                      .id("seek-bar")
                       .w_full()
-                      .h(14)
-                      .flex()
-                      .items_center()
-                      .cursor_pointer()
-                      .tooltip("Click or drag to jump")
-                      .on_size_change((size) => { this.barW = size.width; })
-                      .on_mouse_down("left", (e, cx) => {
-                        if (!this.barW || !e.local_position) return;
-                        cx.stop_propagation();
-                        this.barLeft = e.position.x - e.local_position.x;
-                        this.seekDur = dur;
-                        this.seekAt = Math.max(0, Math.min(1, e.local_position.x / this.barW)) * dur;
-                        cx.notify();
-                      })
+                      .h(this.seekAt != null ? 8 : 6)
+                      .bg("#11111b")
+                      .border_1()
+                      .border_color("#313244")
+                      .overflow_hidden()
                       .child(
                         div()
-                          .w_full()
-                          .h(this.seekAt != null ? 6 : 4)
-                          .rounded(3)
-                          .bg("#1e1e2e")
-                          .overflow_hidden()
+                          .h_full()
+                          .bg(isPlaying || this.seekAt != null ? "#a6e3a1" : "#585b70")
+                          .w(`${Math.max(2, percent)}%`)
+                      )
+                  )
+              )
+              .child(
+                h_flex()
+                  .w_full()
+                  .items_center()
+                  .justify_between()
+                  .child(
+                    h_flex()
+                      .gap(6)
+                      .items_center()
+                      .child(
+                        div()
+                          .text_size(9)
+                          .font_family(MONO)
+                          .font_bold()
+                          .text_color(isPlaying ? "#a6e3a1" : t.dim)
                           .child(
-                            div()
-                              .h_full()
-                              .rounded(3)
-                              .bg(isPlaying || this.seekAt != null ? "#89b4fa" : "#585b70")
-                              .w(`${Math.max(1, percent)}%`)
+                            dur > 0
+                              ? `TAPE TIME: ${formatTime(liveElapsed)} / ${formatTime(dur)}`
+                              : `LIVE STREAM: ${formatTime(liveElapsed)}`
                           )
                       )
                   )
-                )
-                .child(
-                  h_flex()
-                    .w_full()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                      h_flex()
-                        .gap(5)
-                        .items_center()
-                        .child(div().text_size(9.5).child("⏱"))
-                        .child(
+                  .child(
+                    h_flex()
+                      .gap(2)
+                      .items_center()
+                      .children(
+                        [3, 5, 8, 12, 10, 6, 9, 11, 7, 4].map((h, idx) =>
                           div()
-                            .text_size(10)
-                            .font_family(MONO)
-                            .font_semibold()
-                            .text_color(isPlaying ? "#cdd6f4" : t.dim)
-                            .child(
-                              dur > 0
-                                ? `${formatTime(liveElapsed)} / ${formatTime(dur)}`
-                                : `${formatTime(liveElapsed)} (Streaming)`
-                            )
+                            .w(2)
+                            .h(isPlaying ? h : 2)
+                            .bg(isPlaying ? (idx > 7 ? "#f38ba8" : idx > 5 ? "#f9e2af" : "#a6e3a1") : "#313244")
                         )
-                    )
-                    .when(dur > 0, (pct) =>
-                      pct.child(
-                        div()
-                          .text_size(9.5)
-                          .font_family(MONO)
-                          .font_semibold()
-                          .text_color(isPlaying ? "#89b4fa" : t.dim)
-                          .child(`${percent}%`)
                       )
-                    )
-                    .when(dur <= 0, (tag) =>
-                      tag.child(
-                        div()
-                          .px(4)
-                          .py(1)
-                          .rounded(2)
-                          .bg("#313244")
-                          .text_size(8.5)
-                          .font_family(MONO)
-                          .text_color("#89b4fa")
-                          .child("LIVE")
-                      )
-                    )
-                )
-            )
+                  )
+              )
           )
           .child(
             h_flex()
-              .gap(8)
+              .gap(6)
               .items_center()
+              .pt(2)
               .when(isPlaying || isPaused, (el) =>
                 el.child(
-                  div()
-                    .h(26)
+                  h_flex()
+                    .relative()
+                    .h(24)
                     .px(8)
-                    .rounded(4)
-                    .bg("#313244")
-                    .cursor_pointer()
-                    .flex()
                     .items_center()
-                    .text_size(11)
-                    .font_family(MONO)
-                    .font_semibold()
-                    .text_color("#cdd6f4")
-                    .hover((s) => s.bg("#45475a"))
-                    .tooltip("Bài trước / Đài trước (Previous)")
+                    .cursor_pointer()
+                    .children(box("#45475a", "#313244", "#11111b"))
+                    .hover((s) => s.text_color("#ffffff"))
+                    .tooltip("Previous track / station")
                     .on_click((_e, cx) => this.prev(cx))
-                    .child("⏮ Prev")
-                )
+                    .child(
+                      div()
+                        .text_size(9.5)
+                        .font_family(MONO)
+                        .font_bold()
+                        .text_color("#cdd6f4")
+                        .child("⏮ PREV"),
+                    ),
+                ),
               )
               .when(isPlaying, (el) =>
                 el.child(
-                  div()
-                    .h(26)
-                    .px(10)
-                    .rounded(4)
-                    .bg("#313244")
-                    .cursor_pointer()
-                    .flex()
+                  h_flex()
+                    .relative()
+                    .h(24)
+                    .px(9)
                     .items_center()
-                    .text_size(11)
-                    .font_family(MONO)
-                    .font_semibold()
-                    .text_color("#cdd6f4")
-                    .hover((s) => s.bg("#45475a"))
+                    .cursor_pointer()
+                    .children(box("#45475a", "#313244", "#11111b"))
+                    .hover((s) => s.text_color("#ffffff"))
                     .on_click((_e, cx) => this.pause(cx))
-                    .child("⏸ Pause")
-                )
+                    .child(
+                      div()
+                        .text_size(9.5)
+                        .font_family(MONO)
+                        .font_bold()
+                        .text_color("#cdd6f4")
+                        .child("⏸ PAUSE"),
+                    ),
+                ),
               )
               .when(isPaused, (el) =>
                 el.child(
-                  div()
-                    .h(26)
-                    .px(10)
-                    .rounded(4)
-                    .bg("#89b4fa")
-                    .cursor_pointer()
-                    .flex()
+                  h_flex()
+                    .relative()
+                    .h(24)
+                    .px(9)
                     .items_center()
-                    .text_size(11)
-                    .font_family(MONO)
-                    .font_bold()
-                    .text_color("#11111b")
-                    .hover((s) => s.opacity(0.88))
+                    .cursor_pointer()
+                    .children(box("#a6e3a1", "#a6e3a122", "#11111b"))
+                    .hover((s) => s.text_color("#ffffff"))
                     .on_click((_e, cx) => this.resume(cx))
-                    .child("▶ Resume")
-                )
+                    .child(
+                      div()
+                        .text_size(9.5)
+                        .font_family(MONO)
+                        .font_bold()
+                        .text_color("#a6e3a1")
+                        .child("▶ RESUME"),
+                    ),
+                ),
               )
               .when(isPlaying || isPaused || isBuffering, (el) =>
                 el.child(
-                  div()
-                    .h(26)
-                    .px(10)
-                    .rounded(4)
-                    .bg("#f38ba833")
-                    .border_1()
-                    .border_color("#f38ba866")
-                    .cursor_pointer()
-                    .flex()
+                  h_flex()
+                    .relative()
+                    .h(24)
+                    .px(9)
                     .items_center()
-                    .text_size(11)
-                    .font_family(MONO)
-                    .font_semibold()
-                    .text_color("#f38ba8")
-                    .hover((s) => s.bg("#f38ba855"))
+                    .cursor_pointer()
+                    .children(box("#f38ba8", "#f38ba822", "#11111b"))
+                    .hover((s) => s.text_color("#ffffff"))
                     .on_click((_e, cx) => this.stop(cx))
-                    .child("⏹ Stop")
-                )
+                    .child(
+                      div()
+                        .text_size(9.5)
+                        .font_family(MONO)
+                        .font_bold()
+                        .text_color("#f38ba8")
+                        .child("⏹ STOP"),
+                    ),
+                ),
               )
               .when(isPlaying || isPaused, (el) =>
                 el.child(
-                  div()
-                    .h(26)
+                  h_flex()
+                    .relative()
+                    .h(24)
                     .px(8)
-                    .rounded(4)
-                    .bg("#313244")
-                    .cursor_pointer()
-                    .flex()
                     .items_center()
-                    .text_size(11)
-                    .font_family(MONO)
-                    .font_semibold()
-                    .text_color("#cdd6f4")
-                    .hover((s) => s.bg("#45475a"))
-                    .tooltip("Bài kế tiếp / Đài kế tiếp (Next)")
+                    .cursor_pointer()
+                    .children(box("#45475a", "#313244", "#11111b"))
+                    .hover((s) => s.text_color("#ffffff"))
+                    .tooltip("Next track / station")
                     .on_click((_e, cx) => this.next(cx))
-                    .child("⏭ Next")
-                )
-                .child(
-                  div()
+                    .child(
+                      div()
+                        .text_size(9.5)
+                        .font_family(MONO)
+                        .font_bold()
+                        .text_color("#cdd6f4")
+                        .child("⏭ NEXT"),
+                    ),
+                ),
+              )
+              .when(isPlaying || isPaused, (el) =>
+                el.child(
+                  h_flex()
                     .id("btn-mode")
-                    .h(26)
+                    .relative()
+                    .h(24)
                     .px(8)
-                    .rounded(4)
-                    .bg(this.mode && this.mode !== "order" ? "#89b4fa33" : "#313244")
-                    .cursor_pointer()
-                    .flex()
                     .items_center()
-                    .text_size(11)
-                    .font_family(MONO)
-                    .font_semibold()
-                    .text_color(this.mode && this.mode !== "order" ? "#89b4fa" : "#cdd6f4")
-                    .hover((s) => s.bg("#45475a"))
+                    .cursor_pointer()
+                    .children(box(this.mode && this.mode !== "order" ? "#89b4fa" : "#45475a", "#313244", "#11111b"))
                     .tooltip(({ order: "In order", loop: "Repeat list", one: "Repeat one", shuffle: "Shuffle" })[this.mode || "order"] + " · click to switch")
                     .on_click((_e, cx) => this.cycleMode(cx))
-                    .justify_center()
-                    .min_w(30)
-                    .child(svg(`mods/company-music/mode-${this.mode || "order"}.svg`).size(15)
-                      .text_color(this.mode && this.mode !== "order" ? "#89b4fa" : "#cdd6f4"))
-                )
+                    .child(svg(`mods/company-music/mode-${this.mode || "order"}.svg`).size(14)
+                      .text_color(this.mode && this.mode !== "order" ? "#89b4fa" : "#cdd6f4")),
+                ),
               )
           )
       )
@@ -1574,7 +1712,7 @@ export default class CompanyMusic extends View {
                 .child(
                   div()
                     .font_family(MONO)
-                    .text_size(10)
+                    .text_size(9.5)
                     .font_bold()
                     .text_color(t.dim)
                     .child(`RECENTLY PLAYED (${this.history.length})`)
@@ -1582,104 +1720,111 @@ export default class CompanyMusic extends View {
                 .child(
                   div()
                     .cursor_pointer()
-                    .px(6)
+                    .px(5)
                     .py(1)
-                    .rounded(3)
-                    .text_size(9.5)
+                    .bg("#313244")
+                    .border_1()
+                    .border_color("#45475a")
+                    .text_size(9)
                     .font_family(MONO)
-                    .text_color(t.dim)
-                    .hover((s) => s.text_color("#f38ba8"))
+                    .font_bold()
+                    .text_color("#a6adc8")
+                    .hover((s) => s.bg(t.hover))
                     .on_click((_e, cx) => this.clearHistory(cx))
-                    .child("✕ Clear")
+                    .child("× CLEAR")
                 )
             )
-            .children(
-              this.history.map((h, i) => {
-                const active = music.url === h.url;
-                const isPl = h.type === "playlist";
-                const isYt = h.type === "youtube";
-                const badgeColor = isPl ? "#cba6f7" : isYt ? "#f38ba8" : "#89b4fa";
-                const badgeText = isPl ? "PLAYLIST" : isYt ? "YOUTUBE" : "STREAM";
-                const icon = isPl ? "📻" : isYt ? "🎬" : "🎵";
+            .child(
+              v_flex()
+                .w_full()
+                .gap(3)
+                .max_h(120)
+                .overflow_y_scrollbar()
+                .children(
+                  this.history.map((h) => {
+                    const active = music.url === h.url;
+                    const isMedia = h.url.includes("youtube.com") || h.url.includes("youtu.be") || h.url.includes("soundcloud.com");
+                    const icon = isMedia ? "🎬" : "📻";
+                    const badgeText = h.url.includes("soundcloud") ? "SOUNDCLOUD" : isMedia ? "YOUTUBE" : "DIRECT";
+                    const badgeColor = isMedia ? "#f38ba8" : "#89b4fa";
 
-                return h_flex()
-                  .id(`history-item-${i}`)
-                  .w_full()
-                  .h(34)
-                  .px(8)
-                  .gap(8)
-                  .items_center()
-                  .justify_between()
-                  .rounded(6)
-                  .bg(active ? "#313244" : "#11111b")
-                  .border_1()
-                  .border_color(active ? "#89b4fa" : "#313244")
-                  .cursor_pointer()
-                  .hover((s) => s.border_color("#89b4fa"))
-                  .on_click((_e, cx) => {
-                    this.urlInput.set_value(h.url);
-                    this.play(h.url, h.title, cx);
-                  })
-                  .child(
-                    h_flex()
-                      .gap(6)
+                    return h_flex()
+                      .id(h.url)
+                      .w_full()
+                      .h(32)
+                      .px(8)
+                      .gap(7)
                       .items_center()
-                      .min_w(0)
-                      .flex_1()
+                      .justify_between()
+                      .bg(active ? "#313244" : "#11111b")
+                      .border_1()
+                      .border_color(active ? "#89b4fa" : "#313244")
+                      .cursor_pointer()
+                      .hover((s) => s.border_color("#89b4fa"))
+                      .on_click((_e, cx) => {
+                        this.urlInput.set_value(h.url);
+                        this.play(h.url, isMedia ? null : h.title, cx);
+                      })
                       .child(
-                        div()
-                          .px(5)
-                          .py(1)
-                          .rounded(3)
-                          .bg(`${badgeColor}22`)
-                          .border_1()
-                          .border_color(`${badgeColor}55`)
-                          .text_size(8.5)
-                          .font_family(MONO)
-                          .font_bold()
-                          .text_color(badgeColor)
-                          .child(`${icon} ${badgeText}`)
-                      )
-                      .child(
-                        v_flex()
-                          .gap(1)
+                        h_flex()
+                          .gap(6)
+                          .items_center()
                           .min_w(0)
                           .flex_1()
                           .child(
                             div()
-                              .font_semibold()
-                              .text_size(11)
-                              .text_color(active ? "#89b4fa" : t.foreground)
-                              .truncate()
-                              .child(h.title || h.url)
+                              .px(4)
+                              .py(0.5)
+                              .bg(`${badgeColor}22`)
+                              .border_1()
+                              .border_color(`${badgeColor}55`)
+                              .text_size(8)
+                              .font_family(MONO)
+                              .font_bold()
+                              .text_color(badgeColor)
+                              .child(`${icon} ${badgeText}`)
                           )
                           .child(
-                            div()
-                              .text_size(9)
-                              .font_family(MONO)
-                              .text_color(t.dim)
-                              .truncate()
-                              .child(h.url)
+                            v_flex()
+                              .gap(1)
+                              .min_w(0)
+                              .flex_1()
+                              .child(
+                                div()
+                                  .font_bold()
+                                  .text_size(10.5)
+                                  .text_color(active ? "#89b4fa" : t.foreground)
+                                  .truncate()
+                                  .child(h.title || h.url)
+                              )
+                              .child(
+                                div()
+                                  .text_size(8.5)
+                                  .font_family(MONO)
+                                  .text_color(t.dim)
+                                  .truncate()
+                                  .child(h.url)
+                              )
                           )
                       )
-                  )
-                  .child(
-                    div()
-                      .px(6)
-                      .py(2)
-                      .rounded(3)
-                      .bg(active && isPlaying ? "#a6e3a122" : "#181825")
-                      .border_1()
-                      .border_color(active && isPlaying ? "#a6e3a155" : "#313244")
-                      .text_size(9)
-                      .font_family(MONO)
-                      .font_semibold()
-                      .text_color(active && isPlaying ? "#a6e3a1" : "#cdd6f4")
-                      .child(active && isPlaying ? "● PLAYING" : "▶ Play")
-                  );
-              })
+                      .child(
+                        div()
+                          .px(5)
+                          .py(1)
+                          .bg(active && isPlaying ? "#a6e3a122" : "#181825")
+                          .border_1()
+                          .border_color(active && isPlaying ? "#a6e3a1" : "#313244")
+                          .text_size(8.5)
+                          .font_family(MONO)
+                          .font_bold()
+                          .text_color(active && isPlaying ? "#a6e3a1" : "#cdd6f4")
+                          .child(active && isPlaying ? "● PLAYING" : "▶ PLAY")
+                      );
+                  })
+                )
             )
         )
-      );
+      )
+  );
   }
 }

@@ -14,11 +14,13 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 def get_subprocess_kwargs(**kwargs):
+    kwargs["close_fds"] = True
     if sys.platform == "win32":
         flags = kwargs.get("creationflags", 0)
         DETACHED_PROCESS = 0x00000008
         CREATE_NO_WINDOW = 0x08000000
-        kwargs["creationflags"] = flags | DETACHED_PROCESS | CREATE_NO_WINDOW
+        CREATE_BREAKAWAY_FROM_JOB = 0x01000000
+        kwargs["creationflags"] = flags | DETACHED_PROCESS | CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB
         startupinfo = kwargs.get("startupinfo")
         if startupinfo is None:
             startupinfo = subprocess.STARTUPINFO()
@@ -33,7 +35,7 @@ def run_cmd(*args, **kwargs):
 def popen_cmd(*args, **kwargs):
     return subprocess.Popen(*args, **get_subprocess_kwargs(**kwargs))
 
-CACHE_DIR = "/mnt/c/Users/ADMIN/.cache/pixel-hq/music" if (sys.platform != "win32" and os.path.isdir("/mnt/c/Users/ADMIN")) else os.path.expanduser("~/.cache/pixel-hq/music")
+CACHE_DIR = os.environ.get("PIXEL_HQ_CACHE_DIR") or ("/mnt/c/Users/ADMIN/.cache/pixel-hq/music" if (sys.platform != "win32" and os.path.isdir("/mnt/c/Users/ADMIN")) else os.path.expanduser("~/.cache/pixel-hq/music"))
 STATE_FILE = os.path.join(CACHE_DIR, "state.json")
 QUEUE_FILE = os.path.join(CACHE_DIR, "queue.json")
 PREFETCH_PID_FILE = os.path.join(CACHE_DIR, "prefetch.pid")
@@ -41,7 +43,76 @@ HISTORY_FILE = os.path.join(CACHE_DIR, "history.json")
 POSITION_FILE = os.path.join(CACHE_DIR, "position.log")
 MODE_FILE = os.path.join(CACHE_DIR, "mode.json")
 MODES = ("order", "loop", "one", "shuffle")
-POOL_SIZE = 5
+COOKIES_FILE = os.path.join(CACHE_DIR, "cookies.txt")
+LOG_FILE = os.path.join(CACHE_DIR, "player.log")
+
+def log_debug(msg):
+    try:
+        ensure_cache_dir()
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"[{ts}] [{os.getpid()}] {msg}\n")
+    except Exception:
+        pass
+
+def set_cache_dir(new_dir):
+    global CACHE_DIR, STATE_FILE, QUEUE_FILE, PREFETCH_PID_FILE, HISTORY_FILE, POSITION_FILE, MODE_FILE, COOKIES_FILE, LOG_FILE
+    CACHE_DIR = new_dir
+    STATE_FILE = os.path.join(CACHE_DIR, "state.json")
+    QUEUE_FILE = os.path.join(CACHE_DIR, "queue.json")
+    PREFETCH_PID_FILE = os.path.join(CACHE_DIR, "prefetch.pid")
+    HISTORY_FILE = os.path.join(CACHE_DIR, "history.json")
+    POSITION_FILE = os.path.join(CACHE_DIR, "position.log")
+    MODE_FILE = os.path.join(CACHE_DIR, "mode.json")
+    COOKIES_FILE = os.path.join(CACHE_DIR, "cookies.txt")
+    LOG_FILE = os.path.join(CACHE_DIR, "player.log")
+
+def spawn_player_process(player_bin, stream_url, ua, start_seconds=0, page_url=None):
+    is_ffplay = "ffplay" in os.path.basename(player_bin).lower()
+    # Bilibili's CDN refuses audio requests without a bilibili Referer.
+    bilibili = is_bilibili_url(page_url) or is_bilibili_url(stream_url)
+    if is_ffplay:
+        args = [
+            player_bin,
+            "-nodisp",
+            "-autoexit",
+            "-loglevel", "quiet",
+            "-stats",
+            "-reconnect", "1",
+            "-reconnect_streamed", "1",
+            "-reconnect_delay_max", "5",
+            "-reconnect_on_network_error", "1",
+            "-user_agent", ua
+        ]
+        if bilibili:
+            args.extend(["-headers", "Referer: https://www.bilibili.com/\r\n"])
+        if start_seconds > 0:
+            args.extend(["-ss", f"{float(start_seconds):.2f}"])
+        args.append(stream_url)
+    else:
+        args = [player_bin, "--no-video", "--really-quiet", f"--user-agent={ua}"]
+        if bilibili:
+            args.append("--referrer=https://www.bilibili.com/")
+        if start_seconds > 0:
+            args.extend([f"--start={float(start_seconds):.2f}"])
+        args.append(stream_url)
+
+    env = os.environ.copy()
+    env["SDL_VIDEODRIVER"] = "dummy"
+
+    try:
+        proc = popen_cmd(
+            args,
+            stdout=subprocess.DEVNULL,
+            stderr=position_log(),
+            stdin=subprocess.DEVNULL,
+            env=env,
+            start_new_session=True if sys.platform != "win32" else False
+        )
+        return proc, None
+    except Exception as e:
+        return None, str(e)
+POOL_SIZE = 1
 MAX_HISTORY = 3
 
 DEFAULT_PRESETS = [
@@ -115,7 +186,7 @@ def is_valid_player_proc(pid):
     elif sys.platform == "win32":
         try:
             import ctypes
-            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1400
             h = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
             if not h:
                 return False
@@ -340,27 +411,28 @@ def find_running_player_pid():
 def stop_all_players(keep_queue=False):
     kill_prefetch_worker()
     current = read_state()
-    if current and current.get("pid"):
-        stop_process(current["pid"], current.get("status") == "paused")
+    pid = current.get("pid") if current else None
+    is_paused = current.get("status") == "paused" if current else False
+    if not keep_queue:
+        clear_queue()
+        clear_state()
+    if pid:
+        stop_process(pid, is_paused)
+    orphan = find_running_player_pid()
+    if orphan and orphan != pid:
+        stop_process(orphan)
     if sys.platform == "win32":
         try:
             run_cmd(["taskkill", "/F", "/IM", "ffplay.exe"], capture_output=True, timeout=2)
             run_cmd(["taskkill", "/F", "/IM", "mpv.exe"], capture_output=True, timeout=2)
         except Exception:
             pass
-    else:
-        # Two plays close together can leave a second player the state file never knew: end every player this module started.
-        for pattern in ("ffplay -nodisp -autoexit", "mpv --no-video --really-quiet"):
-            try:
-                r = run_cmd(["pgrep", "-f", pattern], capture_output=True, text=True, timeout=2)
-                for p in r.stdout.split():
-                    if p.isdigit() and int(p) != os.getpid():
-                        stop_process(int(p), True)
-            except Exception:
-                pass
-    if not keep_queue:
-        clear_queue()
-    clear_state()
+    elif sys.platform == "darwin" or sys.platform.startswith("linux"):
+        try:
+            run_cmd(["pkill", "-x", "ffplay"], capture_output=True, timeout=2)
+            run_cmd(["pkill", "-x", "mpv"], capture_output=True, timeout=2)
+        except Exception:
+            pass
 
 def find_player_bin():
     for name in ("ffplay", "mpv"):
@@ -462,21 +534,6 @@ def read_position():
     found = re.findall(r"(-?\d+\.\d+)\s+M-A:", tail)
     return float(found[-1]) if found else None
 
-def player_args(player_bin, stream_url, page_url=None, start=0):
-    """Bilibili's CDN refuses audio requests without a bilibili Referer."""
-    is_ffplay = "ffplay" in os.path.basename(player_bin).lower()
-    if is_ffplay:
-        args = [player_bin, "-nodisp", "-autoexit", "-loglevel", "quiet", "-stats"]
-        if start > 0:
-            args += ["-ss", f"{start:.2f}"]
-        if is_bilibili_url(page_url) or is_bilibili_url(stream_url):
-            args += ["-user_agent", "Mozilla/5.0", "-headers", "Referer: https://www.bilibili.com/\r\n"]
-        return args + [stream_url]
-    args = [player_bin, "--no-video", "--really-quiet"] + ([f"--start={start:.2f}"] if start > 0 else [])
-    if is_bilibili_url(page_url) or is_bilibili_url(stream_url):
-        args += ["--referrer=https://www.bilibili.com/", "--user-agent=Mozilla/5.0"]
-    return args + [stream_url]
-
 def extract_stream_info(url):
     yt_dlp = find_ytdlp_bin()
     if not yt_dlp:
@@ -494,9 +551,12 @@ def extract_stream_info(url):
     env = os.environ.copy()
     env["PYTHONUTF8"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
+    extra_args = []
+    if os.path.isfile(COOKIES_FILE):
+        extra_args.extend(["--cookies", COOKIES_FILE])
     try:
         r = run_cmd(
-            [*cmd, "--encoding", "utf-8", "--no-warnings", "--no-playlist", "-f", "ba/b", "--print", "%(title)s", "--print", "%(duration)s", "-g", clean_url],
+            [*cmd, "--encoding", "utf-8", "--no-warnings", "--no-playlist", *extra_args, "--extractor-args", "youtube:player_client=ios,android,web", "-f", "ba/b", "--print", "%(title)s", "--print", "%(duration)s", "-g", clean_url],
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -524,7 +584,13 @@ def extract_stream_info(url):
                     # Bilibili's Akamai mirror answers 5XX for some tracks; its overseas COS mirror serves the same signed path.
                     stream_url = re.sub(r"^https://[^/]*akamaized\.net/", "https://upos-sz-mirrorcosov.bilivideo.com/", stream_url)
                 return title, stream_url, duration, None
+        err_msg = r.stderr.strip() if r.stderr else ""
+        if "Sign in to confirm you're not a bot" in err_msg or "Sign in to confirm you’re not a bot" in err_msg:
+            log_debug(f"cmd_extract_stream_info bot_check: {err_msg}")
+            return None, None, 0, "YouTube anti-bot challenge: YouTube temporarily blocked this IP due to continuous playback ('Sign in to confirm you're not a bot'). You can switch networks/VPN or wait 30-60 minutes."
+        log_debug(f"cmd_extract_stream_info error: returncode={r.returncode}, stderr={err_msg}")
     except Exception as e:
+        log_debug(f"cmd_extract_stream_info exception: {e}")
         return None, None, 0, f"Failed to extract stream: {str(e)}"
 
     return None, None, 0, "Extractor error. YouTube or SoundCloud stream could not be resolved. Try running 'yt-dlp -U'."
@@ -620,9 +686,12 @@ def extract_playlist_items(url, limit=25):
     env = os.environ.copy()
     env["PYTHONUTF8"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
+    extra_args = []
+    if os.path.isfile(COOKIES_FILE):
+        extra_args.extend(["--cookies", COOKIES_FILE])
     try:
         r = run_cmd(
-            [*cmd, "--encoding", "utf-8", "--no-warnings", "--flat-playlist", "--playlist-end", str(limit), "--print", "%(id)s\t%(title)s\t%(duration)s\t%(url)s", url],
+            [*cmd, "--encoding", "utf-8", "--no-warnings", "--flat-playlist", "--playlist-end", str(limit), *extra_args, "--print", "%(id)s\t%(title)s\t%(duration)s\t%(url)s", url],
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -756,6 +825,7 @@ def cmd_prefetch():
             it = q_now["items"][idx]
             if it.get("stream_url") and (now - it.get("resolved_at", 0) < 14400):
                 continue
+            time.sleep(3)
             ext_title, ext_stream, ext_dur, err = extract_stream_info(it["url"])
             if ext_stream:
                 q_update = read_queue()
@@ -780,12 +850,11 @@ def cmd_prefetch():
 
     return {"status": "ok"}
 
-def cmd_play_queue_index(index):
+def cmd_play_queue_index(index, start_seconds=0):
     queue = read_queue()
     if not queue or not queue.get("items") or index < 0 or index >= len(queue["items"]):
         return {"status": "error", "error": "Invalid queue index", "playing": False}
 
-    stop_all_players(keep_queue=True)
     item = queue["items"][index]
     queue["current_index"] = index
     write_queue(queue)
@@ -796,23 +865,47 @@ def cmd_play_queue_index(index):
     duration = item.get("duration", 0)
     now = int(time.time())
 
+    write_state({
+        "pid": None,
+        "startTime": now,
+        "elapsed": start_seconds,
+        "duration": duration,
+        "currentElapsed": start_seconds,
+        "url": url,
+        "title": f"[{index + 1}/{len(queue['items'])}] {title}",
+        "status": "buffering",
+        "playing": False,
+        "source": "youtube",
+        "playlist": {
+            "index": index + 1,
+            "total": len(queue["items"])
+        },
+        "history": read_history()
+    })
+
+    stop_all_players(keep_queue=True)
+
+    write_state({
+        "pid": None,
+        "startTime": now,
+        "elapsed": start_seconds,
+        "duration": duration,
+        "currentElapsed": start_seconds,
+        "url": url,
+        "title": f"[{index + 1}/{len(queue['items'])}] {title}",
+        "status": "buffering",
+        "playing": False,
+        "source": "youtube",
+        "playlist": {
+            "index": index + 1,
+            "total": len(queue["items"])
+        },
+        "history": read_history()
+    })
+
     if not stream_url or (now - item.get("resolved_at", 0) >= 14400):
-        write_state({
-            "pid": None,
-            "startTime": now,
-            "elapsed": 0,
-            "duration": duration,
-            "currentElapsed": 0,
-            "url": url,
-            "title": f"[{index + 1}/{len(queue['items'])}] {title}",
-            "status": "buffering",
-            "playing": False,
-            "source": "youtube"
-        })
         ext_title, ext_stream, ext_dur, err = extract_stream_info(url)
         if err or not ext_stream:
-            if index + 1 < len(queue["items"]):
-                return cmd_play_queue_index(index + 1)
             clear_state()
             return {"status": "error", "error": err or "Failed to extract stream", "playing": False}
         stream_url = ext_stream
@@ -833,30 +926,19 @@ def cmd_play_queue_index(index):
         clear_state()
         return {"status": "error", "error": "Neither ffplay nor mpv found. Install ffmpeg or mpv to enable playback.", "playing": False}
 
-    args = player_args(player_bin, stream_url, url)
-    env = os.environ.copy()
-    env["SDL_VIDEODRIVER"] = "dummy"
-
-    try:
-        proc = popen_cmd(
-            args,
-            stdout=subprocess.DEVNULL,
-            stderr=position_log(),
-            stdin=subprocess.DEVNULL,
-            env=env,
-            start_new_session=True if sys.platform != "win32" else False
-        )
-    except Exception as e:
+    ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    proc, err = spawn_player_process(player_bin, stream_url, ua, start_seconds=start_seconds, page_url=url)
+    if err or not proc:
         clear_state()
-        return {"status": "error", "error": f"Failed to start player process: {str(e)}", "playing": False}
+        return {"status": "error", "error": f"Failed to start player process: {err}", "playing": False}
 
     display_title = f"[{index + 1}/{len(queue['items'])}] {title}"
     state = {
         "pid": proc.pid,
         "startTime": int(time.time()),
-        "elapsed": 0,
+        "elapsed": start_seconds,
         "duration": duration,
-        "currentElapsed": 0,
+        "currentElapsed": start_seconds,
         "url": url,
         "title": display_title,
         "status": "playing",
@@ -1019,13 +1101,10 @@ def cmd_seek(seconds):
         return {"status": "error", "error": "Neither ffplay nor mpv found. Install ffmpeg or mpv to enable playback.", "playing": False}
     if cur.get("pid"):
         stop_process(cur["pid"])
-    env = os.environ.copy()
-    env["SDL_VIDEODRIVER"] = "dummy"
-    try:
-        proc = popen_cmd(player_args(player_bin, stream, cur["url"], pos), stdout=subprocess.DEVNULL, stderr=position_log(),
-                         stdin=subprocess.DEVNULL, env=env, start_new_session=True if sys.platform != "win32" else False)
-    except Exception as e:
-        return {"status": "error", "error": f"Failed to start player process: {str(e)}", "playing": False}
+    ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    proc, err = spawn_player_process(player_bin, stream, ua, start_seconds=pos, page_url=cur["url"])
+    if err or not proc:
+        return {"status": "error", "error": f"Failed to start player process: {err}", "playing": False}
     cur.update({"pid": proc.pid, "startTime": int(time.time()), "elapsed": int(pos), "currentElapsed": int(pos),
                 "status": "playing", "playing": True, "stream_url": stream})
     cur.pop("pausedAt", None)
@@ -1263,56 +1342,58 @@ def cmd_play(url, preset_title=None):
             "history": read_history()
         })
         video_id = extract_video_id(res)
-        first_url = f"https://www.youtube.com/watch?v={video_id}" if video_id else None
-        if not first_url:
-            init_items = extract_playlist_items(res, limit=1)
-            if init_items:
-                first_url = init_items[0]["url"]
-                video_id = init_items[0]["id"]
-            else:
-                first_url = res
+        init_items = extract_playlist_items(res, limit=20 if is_bilibili_url(res) else 25)
+        if init_items:
+            first_url = init_items[0]["url"]
+            video_id = init_items[0]["id"]
+            first_title = init_items[0]["title"]
+            first_dur = init_items[0]["duration"]
+        elif video_id:
+            first_url = f"https://www.youtube.com/watch?v={video_id}"
+            first_title = "YouTube Track"
+            first_dur = 0
+            init_items = [{
+                "id": video_id,
+                "title": first_title,
+                "duration": first_dur,
+                "url": first_url,
+                "stream_url": None,
+                "resolved_at": 0
+            }]
+        else:
+            first_url = res
+            first_title = "YouTube Track"
+            first_dur = 0
+            init_items = []
 
         ext_title, ext_stream, ext_dur, err = extract_stream_info(first_url)
         if err or not ext_stream:
-            init_items = extract_playlist_items(res, limit=5)
-            if len(init_items) > 1:
-                queue_data = {
-                    "playlist_url": res,
-                    "current_index": 0,
-                    "items": init_items,
-                    "needs_expansion": True
-                }
-                write_queue(queue_data)
-                return cmd_play_queue_index(0)
             clear_state()
             return {"status": "error", "error": err or "Failed to extract stream", "playing": False, "history": read_history()}
+
+        if init_items:
+            init_items[0]["stream_url"] = ext_stream
+            if ext_title:
+                init_items[0]["title"] = ext_title
+            if ext_dur:
+                init_items[0]["duration"] = ext_dur
+            init_items[0]["resolved_at"] = int(time.time())
 
         player_bin = find_player_bin()
         if not player_bin:
             clear_state()
             return {"status": "error", "error": "Neither ffplay nor mpv found. Install ffmpeg or mpv to enable playback.", "playing": False, "history": read_history()}
 
-        args = player_args(player_bin, ext_stream, first_url)
-        env = os.environ.copy()
-        env["SDL_VIDEODRIVER"] = "dummy"
-
-        try:
-            proc = popen_cmd(
-                args,
-                stdout=subprocess.DEVNULL,
-                stderr=position_log(),
-                stdin=subprocess.DEVNULL,
-                env=env,
-                start_new_session=True if sys.platform != "win32" else False
-            )
-        except Exception as e:
+        ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        proc, err = spawn_player_process(player_bin, ext_stream, ua, page_url=first_url)
+        if err or not proc:
             clear_state()
-            return {"status": "error", "error": f"Failed to start player process: {str(e)}", "playing": False, "history": read_history()}
+            return {"status": "error", "error": f"Failed to start player process: {err}", "playing": False, "history": read_history()}
 
         queue_data = {
             "playlist_url": res,
             "current_index": 0,
-            "items": [{
+            "items": init_items if init_items else [{
                 "id": video_id or "track-1",
                 "title": ext_title or "YouTube Track",
                 "duration": ext_dur or 0,
@@ -1320,25 +1401,26 @@ def cmd_play(url, preset_title=None):
                 "stream_url": ext_stream,
                 "resolved_at": int(time.time())
             }],
-            "needs_expansion": True
+            "needs_expansion": is_bilibili_url(res)
         }
         write_queue(queue_data)
 
-        display_title = ext_title or "YouTube Track"
+        display_title = ext_title or (init_items[0]["title"] if init_items else "YouTube Track")
+        total_count = len(init_items) if init_items else 1
         state = {
             "pid": proc.pid,
             "startTime": int(time.time()),
             "elapsed": 0,
-            "duration": ext_dur or 0,
+            "duration": ext_dur or (init_items[0]["duration"] if init_items else 0),
             "currentElapsed": 0,
             "url": first_url,
-            "title": display_title,
+            "title": f"[1/{total_count}] {display_title}",
             "status": "playing",
             "playing": True,
             "source": "youtube",
             "playlist": {
                 "index": 1,
-                "total": 1
+                "total": total_count
             },
             "history": read_history()
         }
@@ -1394,22 +1476,11 @@ def cmd_play(url, preset_title=None):
             title = derive_direct_title(res)
             update_history_title(res, title)
 
-    args = player_args(player_bin, stream_url, res)
-    env = os.environ.copy()
-    env["SDL_VIDEODRIVER"] = "dummy"
-
-    try:
-        proc = popen_cmd(
-            args,
-            stdout=subprocess.DEVNULL,
-            stderr=position_log(),
-            stdin=subprocess.DEVNULL,
-            env=env,
-            start_new_session=True if sys.platform != "win32" else False
-        )
-    except Exception as e:
+    ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    proc, err = spawn_player_process(player_bin, stream_url, ua, page_url=res)
+    if err or not proc:
         clear_state()
-        return {"status": "error", "error": f"Failed to start player process: {str(e)}", "playing": False, "history": read_history()}
+        return {"status": "error", "error": f"Failed to start player process: {err}", "playing": False, "history": read_history()}
 
     state = {
         "pid": proc.pid,
@@ -1471,6 +1542,7 @@ def cmd_clear_queue():
 
 def cmd_stop():
     stop_all_players(keep_queue=True)
+    clear_state()
     return {"status": "idle", "playing": False, "title": "", "url": "", "source": "direct", "elapsed": 0, "duration": 0, "currentElapsed": 0, "history": read_history()}
 
 def default_output_device():
@@ -1495,15 +1567,43 @@ def default_output_device():
 
 def cmd_status():
     current = read_state()
-    if current and current.get("status") == "paused" and not current.get("pid"):
-        current.update({"position": current.get("pausedAt"), "positionAt": time.time(), "mode": read_mode(), "history": read_history()})
+    if not current:
+        orphan_pid = find_running_player_pid()
+        if orphan_pid:
+            state = {
+                "pid": orphan_pid,
+                "startTime": int(time.time()),
+                "elapsed": 0,
+                "duration": 0,
+                "currentElapsed": 0,
+                "url": "",
+                "title": "Audio Stream",
+                "status": "playing",
+                "playing": True,
+                "source": "direct",
+                "history": read_history()
+            }
+            write_state(state)
+            return state
+        return {"status": "idle", "playing": False, "title": "", "url": "", "source": "direct", "elapsed": 0, "duration": 0, "currentElapsed": 0, "history": read_history()}
+
+    status = current.get("status")
+    if status == "buffering":
+        if int(time.time()) - current.get("startTime", 0) <= 35:
+            current["currentElapsed"] = current.get("elapsed", 0)
+            current["history"] = read_history()
+            return current
+
+    if status == "paused":
+        current["currentElapsed"] = current.get("elapsed", 0)
+        current.update({"position": current.get("pausedAt", current.get("elapsed")), "positionAt": time.time(), "mode": read_mode(), "history": read_history()})
         return current
-    if current and current.get("pid"):
+
+    if status == "playing" and current.get("pid"):
         now = int(time.time())
         base = current.get("elapsed", 0)
         dur = current.get("duration", 0)
-        is_playing = current.get("playing", False)
-        current_elapsed = base + (max(0, now - current.get("startTime", now)) if is_playing else 0)
+        current_elapsed = base + max(0, now - current.get("startTime", now))
         current["currentElapsed"] = current_elapsed
         current["history"] = read_history()
 
@@ -1511,11 +1611,11 @@ def cmd_status():
         current["position"] = read_position()
         current["positionAt"] = time.time()
         proc_alive = is_valid_player_proc(current["pid"])
-        is_expired = is_playing and dur > 0 and current_elapsed >= dur + 1.5
+        is_expired = dur > 0 and current_elapsed >= dur + 1.5
 
         if proc_alive and not is_expired:
             dev = default_output_device()
-            if dev is not None and is_playing:
+            if dev is not None:
                 if current.get("outputPid") != current["pid"]:
                     current.update({"outputPid": current["pid"], "outputDevice": dev})
                     write_state({k: v for k, v in current.items() if k not in ("history", "mode", "position", "positionAt")})
@@ -1523,53 +1623,40 @@ def cmd_status():
                     return cmd_pause()
             return current
 
-        if is_playing and (now - current.get("startTime", now) < 6) and not is_expired:
-            orphan = find_running_player_pid()
-            if orphan:
-                current["pid"] = orphan
-                write_state(current)
-                return current
+        orphan = find_running_player_pid()
+        if orphan:
+            current["pid"] = orphan
+            write_state(current)
             return current
 
-    if current and current.get("status") == "buffering":
-        if int(time.time()) - current.get("startTime", 0) <= 35:
-            current["currentElapsed"] = current.get("elapsed", 0)
-            current["history"] = read_history()
-            return current
+        is_completed = is_expired or (dur > 0 and current_elapsed >= max(15, min(dur - 3, int(dur * 0.95)))) or (dur == 0 and current_elapsed >= 15)
 
-    # A track that died within 5 s failed to play: never repeat it, move on.
-    failed = bool(current and int(time.time()) - int(current.get("startTime") or 0) < 5)
-    queue = read_queue()
-    if queue and queue.get("items"):
-        nxt = next_index(queue, auto=True) if current else None
-        if failed and nxt == queue.get("current_index", 0):
-            nxt = nxt + 1 if nxt + 1 < len(queue["items"]) else None
-        if nxt is not None:
-            res = cmd_play_queue_index(nxt)
+        queue = read_queue()
+        if queue and queue.get("items"):
+            cur_idx = queue.get("current_index", 0)
+            items = queue.get("items", [])
+            if is_completed:
+                nxt = next_index(queue, auto=True)
+                if nxt is not None:
+                    res = cmd_play_queue_index(nxt)
+                    res["history"] = read_history()
+                    return res
+            else:
+                retry_count = current.get("retry_count", 0)
+                if retry_count < 1 and cur_idx < len(items):
+                    current["retry_count"] = retry_count + 1
+                    items[cur_idx]["stream_url"] = None
+                    items[cur_idx]["resolved_at"] = 0
+                    queue["items"] = items
+                    write_queue(queue)
+                    res = cmd_play_queue_index(cur_idx, start_seconds=current_elapsed)
+                    res["retry_count"] = retry_count + 1
+                    write_state(res)
+                    return res
+        elif is_completed and current.get("url") and read_mode() in ("one", "loop"):
+            res = cmd_play(current["url"], re.sub(r"^\[\d+/\d+\] ", "", current.get("title") or "") or None)
             res["history"] = read_history()
             return res
-    elif current and current.get("url") and read_mode() in ("one", "loop") and not failed:
-        res = cmd_play(current["url"], re.sub(r"^\[\d+/\d+\] ", "", current.get("title") or "") or None)
-        res["history"] = read_history()
-        return res
-
-    orphan_pid = find_running_player_pid()
-    if orphan_pid:
-        state = {
-            "pid": orphan_pid,
-            "startTime": int(time.time()),
-            "elapsed": 0,
-            "duration": 0,
-            "currentElapsed": 0,
-            "url": current.get("url", "") if current else "",
-            "title": current.get("title", "Audio Stream") if (current and current.get("title") and current.get("title") != "Buffering stream...") else "Audio Stream",
-            "status": "playing",
-            "playing": True,
-            "source": current.get("source", "direct") if current else "direct",
-            "history": read_history()
-        }
-        write_state(state)
-        return state
 
     clear_state()
     return {"status": "idle", "playing": False, "title": "", "url": "", "source": "direct", "elapsed": 0, "duration": 0, "currentElapsed": 0, "history": read_history()}

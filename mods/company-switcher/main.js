@@ -1,11 +1,21 @@
 // Pixel HQ Floor Switcher
 // Instant switching between workspace floors with quick search, arrow navigation, 1-9 shortcuts, and Ctrl+P cycling.
 
-import { View, div } from "gpui-kit";
+import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input } from "gpui-base";
 import { spaces, agents, run, theme, props, closeOverlay, nextCommand } from "herdr";
 
 const MONO = "JetBrains Mono, Menlo, monospace";
+
+const notch = (c, [l, r, t, b]) => [
+  div().absolute().left(l + 2).right(r + 2).top(t).bottom(b).bg(c),
+  div().absolute().left(l).right(r).top(t + 2).bottom(b + 2).bg(c),
+];
+const box = (frame, fill, shadow) => [
+  ...notch(shadow, [2, 0, 2, 0]),
+  ...notch(frame, [0, 2, 0, 2]),
+  ...notch(fill, [2, 4, 2, 4]),
+];
 
 export default class CompanySwitcher extends View {
   init(_props, cx) {
@@ -154,200 +164,232 @@ export default class CompanySwitcher extends View {
       })
       .size_full()
       .min_h(0)
-      .p(16)
-      .gap(12)
-      .bg("#181825")
-      .rounded(14)
-      .border_1()
-      .border_color("#ffffff14")
-      .text_size(13)
+      .relative()
+      .children(box("#45475a", "#181825", "#11111b"))
       .child(
-        h_flex()
-          .h(32)
-          .items_center()
-          .justify_between()
+        v_flex()
+          .relative()
+          .size_full()
+          .p(10)
+          .gap(8)
+          .font_family(MONO)
           .child(
             h_flex()
-              .gap(8)
+              .w_full()
+              .pb(6)
               .items_center()
+              .justify_between()
+              .border_b(1)
+              .border_color("#313244")
               .child(
                 h_flex()
-                  .size(24)
-                  .rounded(6)
-                  .bg("#89b4fa22")
+                  .gap(8)
                   .items_center()
-                  .justify_center()
-                  .child(div().text_size(12).font_bold().text_color("#89b4fa").child("⌘")),
+                  .child(svg("mods/company-spaces/monitor.svg").size(15).text_color("#89b4fa"))
+                  .child(
+                    div()
+                      .font_family(MONO)
+                      .text_size(12)
+                      .font_bold()
+                      .text_color("#cdd6f4")
+                      .child("FLOOR SWITCHER // DIRECTORY"),
+                  )
+                  .child(
+                    div()
+                      .px(4)
+                      .py(1)
+                      .bg("#89b4fa18")
+                      .border_1()
+                      .border_color("#89b4fa44")
+                      .font_family(MONO)
+                      .text_size(8.5)
+                      .font_bold()
+                      .text_color("#89b4fa")
+                      .child("CTRL+P"),
+                  ),
               )
               .child(
-                div()
-                  .text_size(14)
-                  .font_semibold()
-                  .text_color("#cdd6f4")
-                  .child("Pixel HQ Floor Switcher"),
+                h_flex()
+                  .id("btn-esc-switcher")
+                  .relative()
+                  .h(22)
+                  .px(8)
+                  .items_center()
+                  .justify_center()
+                  .cursor_pointer()
+                  .children(box("#45475a", "#313244", "#11111b"))
+                  .hover((s) => s.text_color("#ffffff"))
+                  .on_click(() => closeOverlay(props()?.overlay))
+                  .child(
+                    div()
+                      .font_family(MONO)
+                      .text_size(9.5)
+                      .font_bold()
+                      .text_color("#a6adc8")
+                      .child("ESC"),
+                  ),
               ),
           )
           .child(
-            div()
-              .id("btn-esc-switcher")
+            h_flex()
+              .relative()
+              .h(32)
               .px(8)
-              .py(3)
-              .rounded(5)
-              .text_size(11)
-              .text_color("#6c7086")
-              .cursor_pointer()
-              .hover((s) => s.bg("#ffffff14").text_color("#cdd6f4"))
-              .on_click(() => closeOverlay(props()?.overlay))
-              .child("Esc"),
-          ),
-      )
-      .child(
-        Input.new(this.input)
-          .h(36)
-          .flex_none()
-          .px(10)
-          .rounded(8)
-          .border_1()
-          .border_color("#89b4fa")
-          .bg("#1e1e2e")
-          .text_size(12.8)
-          .text_color("#cdd6f4"),
-      )
-      .child(
-        v_flex()
-          .flex_1()
-          .min_h(0)
-          .overflow_y_scrollbar()
-          .py(2)
-          .gap(6)
-          .children(
-            list.map((s, i) => {
-              const on = s.active;
-              const isSel = this.selected === i;
-              const crew = crewMap.get(s.id) ?? [];
-              const working = crew.filter((a) => a.status === "working").length;
-              const blocked = crew.filter((a) => a.status === "blocked").length;
-              const dotColor = blocked > 0 ? "#f38ba8" : working > 0 ? "#89b4fa" : "#a6e3a1";
+              .gap(8)
+              .items_center()
+              .bg("#0d0e15")
+              .border_1()
+              .border_color("#313244")
+              .child(div().font_family(MONO).font_bold().text_size(13).text_color("#89b4fa").child(">"))
+              .child(
+                Input.new(this.input)
+                  .h_full()
+                  .w_full()
+                  .font_family(MONO)
+                  .text_size(11.5)
+                  .text_color("#cdd6f4"),
+              ),
+          )
+          .child(
+            v_flex()
+              .flex_1()
+              .min_h(0)
+              .overflow_y_scrollbar()
+              .py(2)
+              .gap(6)
+              .children(
+                list.map((s, i) => {
+                  const on = s.active;
+                  const isSel = this.selected === i;
+                  const crew = crewMap.get(s.id) ?? [];
+                  const working = crew.filter((a) => a.status === "working").length;
+                  const blocked = crew.filter((a) => a.status === "blocked").length;
+                  const dotColor = blocked > 0 ? "#f38ba8" : working > 0 ? "#89b4fa" : "#a6e3a1";
 
-              return h_flex()
-                .id(`space-row-${s.id}`)
-                .h(42)
-                .px(10)
-                .rounded(8)
-                .items_center()
-                .justify_between()
-                .cursor_pointer()
-                .bg(isSel ? "#313244" : on ? "#ffffff0c" : "#00000000")
-                .border_1()
-                .border_color(isSel ? "#89b4fa66" : on ? "#89b4fa33" : "#00000000")
-                .hover((st) => st.bg("#313244"))
-                .on_click(() => {
-                  run("space.select", { id: s.id });
-                  closeOverlay(props()?.overlay);
-                })
-                .child(
-                  h_flex()
-                    .gap(10)
+                  return h_flex()
+                    .id(`space-row-${s.id}`)
+                    .h(42)
+                    .px(10)
                     .items_center()
+                    .justify_between()
+                    .cursor_pointer()
+                    .bg(isSel ? "#2a2b3d" : on ? "#1e1e2e" : "#14141e")
+                    .border_1()
+                    .border_color(isSel ? "#89b4fa" : on ? "#45475a" : "#262637")
+                    .hover((st) => st.bg("#2e3146"))
+                    .on_click(() => {
+                      run("space.select", { id: s.id });
+                      closeOverlay(props()?.overlay);
+                    })
                     .child(
                       h_flex()
-                        .h(22)
-                        .px(7)
-                        .rounded(5)
-                        .bg("#1e1e2e")
-                        .border_1()
-                        .border_color("#ffffff14")
+                        .gap(8)
                         .items_center()
-                        .justify_center()
+                        .when(isSel, (el) => el.child(div().font_family(MONO).font_bold().text_size(11).text_color("#89b4fa").child("▶")))
+                        .when(!isSel, (el) => el.child(div().w(8)))
                         .child(
                           div()
-                            .text_size(11)
+                            .px(5)
+                            .py(1.5)
+                            .bg("#11111b")
+                            .border_1()
+                            .border_color(isSel ? "#89b4fa" : "#45475a")
+                            .font_family(MONO)
+                            .text_size(9.5)
                             .font_bold()
-                            .text_color("#89b4fa")
-                            .child(`Floor ${i + 1}`),
+                            .text_color(isSel ? "#89b4fa" : "#a6adc8")
+                            .child(`F${i + 1}`)
+                        )
+                        .child(
+                          v_flex()
+                            .gap(1)
+                            .child(
+                              h_flex()
+                                .gap(6)
+                                .items_center()
+                                .child(
+                                  div()
+                                    .font_family(MONO)
+                                    .text_size(12)
+                                    .font_bold()
+                                    .text_color(isSel ? "#89b4fa" : "#cdd6f4")
+                                    .child(s.name ?? "unnamed"),
+                                )
+                                .when(on, (ch) =>
+                                  ch.child(
+                                    div()
+                                      .px(4)
+                                      .py(0.5)
+                                      .font_family(MONO)
+                                      .text_size(8.5)
+                                      .font_bold()
+                                      .bg("#89b4fa26")
+                                      .border_1()
+                                      .border_color("#89b4fa55")
+                                      .text_color("#89b4fa")
+                                      .child("CURRENT FLOOR"),
+                                  ),
+                                ),
+                            )
+                            .child(
+                              div()
+                                .font_family(MONO)
+                                .text_size(9.5)
+                                .text_color("#6c7086")
+                                .child(s.folder ? s.folder.replace(/\/+$/, "").split("/").pop() : "~"),
+                            ),
                         ),
                     )
                     .child(
-                      v_flex()
-                        .gap(1)
-                        .child(
-                          h_flex()
-                            .gap(8)
-                            .items_center()
-                            .child(
-                              div()
-                                .text_size(13)
-                                .font_medium()
-                                .text_color("#cdd6f4")
-                                .child(s.name ?? "unnamed"),
-                            )
-                            .when(on, (ch) =>
-                              ch.child(
+                      h_flex()
+                        .gap(8)
+                        .items_center()
+                        .when(crew.length > 0, (ch) =>
+                          ch.child(
+                            h_flex()
+                              .gap(5)
+                              .items_center()
+                              .child(div().size(6).bg(dotColor))
+                              .child(
                                 div()
-                                  .px(5)
-                                  .py(0.5)
-                                  .rounded(4)
-                                  .text_size(10)
-                                  .bg("#89b4fa22")
-                                  .text_color("#89b4fa")
-                                  .child("current"),
+                                  .font_family(MONO)
+                                  .text_size(9.5)
+                                  .text_color("#a6adc8")
+                                  .child(`${crew.length} ABOARD`),
                               ),
-                            ),
+                          ),
                         )
                         .child(
                           div()
-                            .text_size(10.5)
-                            .text_color("#6c7086")
-                            .child(s.folder ? s.folder.replace(/\/+$/, "").split("/").pop() : "~"),
-                        ),
-                    ),
-                )
-                .child(
-                  h_flex()
-                    .gap(10)
-                    .items_center()
-                    .when(crew.length > 0, (ch) =>
-                      ch.child(
-                        h_flex()
-                          .gap(5)
-                          .items_center()
-                          .child(div().size(6).rounded_full().bg(dotColor))
-                          .child(
-                            div()
-                              .text_size(11)
-                              .text_color("#a6adc8")
-                              .child(`${crew.length} staff`),
-                          ),
-                      ),
-                    )
-                    .child(
-                      h_flex()
-                        .h(20)
-                        .px(6)
-                        .rounded(4)
-                        .bg("#11111b")
-                        .border_1()
-                        .border_color("#ffffff10")
-                        .items_center()
-                        .child(
-                          div()
-                            .text_size(10.5)
+                            .px(5)
+                            .py(1.5)
+                            .bg("#11111b")
+                            .border_1()
+                            .border_color("#45475a")
+                            .text_size(9)
                             .font_family(MONO)
+                            .font_bold()
                             .text_color("#a6adc8")
-                            .child(`Alt+${i + 1}`),
+                            .child(`ALT+${i + 1}`)
                         ),
-                    ),
-                );
-            }),
+                    );
+                }),
+              ),
+          )
+          .child(
+            h_flex()
+              .h(24)
+              .px(6)
+              .items_center()
+              .justify_between()
+              .border_t(1)
+              .border_color("#313244")
+              .font_family(MONO)
+              .text_size(9)
+              .text_color("#6c7086")
+              .child("CTRL+P TO CYCLE · 1–9 TO JUMP · ENTER SELECT")
+              .child("ESC CLOSE"),
           ),
-      )
-      .child(
-        h_flex()
-          .justify_between()
-          .text_size(11)
-          .text_color("#6c7086")
-          .child("Hold Ctrl + press P to cycle & release to switch · 1–9 quick jump")
-          .child("Esc close"),
       );
   }
 }

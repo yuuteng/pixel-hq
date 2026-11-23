@@ -1,6 +1,5 @@
 import { View, div, svg, image } from "gpui-kit";
 import { h_flex, ScrollHandle } from "gpui-base";
-// Herdr's tabs bar, plus a PRs button that opens the company-prs panel.
 import { spaces, panes, run, openOverlay, theme, window, shared, layout, settings, nextCommand, checking } from "herdr";
 
 function find(node, id) {
@@ -28,11 +27,48 @@ function label(tab, lead) {
   return (tab.name === prog || !tab.named) && telling ? live : base;
 }
 
+const MONO = "JetBrains Mono";
+// A notched rectangle, drawn as two overlapping blocks with 2px cut corners. Insets are
+// [left, right, top, bottom] from the container, so a shape can sit inside another.
+const notch = (c, [l, r, t, b]) => [
+  div().absolute().left(l + 2).right(r + 2).top(t).bottom(b).bg(c),
+  div().absolute().left(l).right(r).top(t + 2).bottom(b + 2).bg(c),
+];
+// A pixel box: a 2px frame and a hard 2px shadow, both notched. The container leaves the
+// shadow's 2px on its right and bottom; the content sits 2px inside the frame.
+const box = (frame, fill, shadow) => [
+  ...notch(shadow, [2, 0, 2, 0]),
+  ...notch(frame, [0, 2, 0, 2]),
+  ...notch(fill, [2, 4, 2, 4]),
+];
+// A pixel X: 2px steps down both diagonals, so it reads as a cross, not a plus.
+const cross = (c, size) => {
+  const step = size / 4;
+  return [0, 1, 2, 3].flatMap((i) => [
+    div().absolute().left(i * step).top(i * step).w(step).h(step).bg(c),
+    div().absolute().left(size - step - i * step).top(i * step).w(step).h(step).bg(c),
+  ]);
+};
+
+// Status marks, drawn in 2px pixels so they read at a glance.
+// A pixel ring: eight 4px cells around a 12px square, a bright head and a fading tail.
+const RING = [[0, 0], [1, 0], [2, 0], [2, 1], [2, 2], [1, 2], [0, 2], [0, 1]];
+const spinner = (c, f) => div().relative().flex_none().size(14)
+  .children(RING.map(([x, y], i) => div().absolute().left(x * 5).top(y * 5).size(4).bg(c).opacity([1, 0.8, 0.55, 0.35, 0.2, 0.12, 0.12, 0.12][(f - i + 8) % 8])));
+const tick = (c) => div().relative().flex_none().w(10).h(10)
+  .children([[0, 6], [2, 8], [4, 6], [6, 4], [8, 2]].map(([x, y]) => div().absolute().left(x).top(y - 2).w(2).h(4).bg(c)));
+const bang = (c) => div().relative().flex_none().w(4).h(10)
+  .children([div().absolute().left(1).top(0).w(2).h(6).bg(c), div().absolute().left(1).top(8).w(2).h(2).bg(c)]);
+const plus = (c) => div().relative().flex_none().w(10).h(10)
+  .children([div().absolute().left(3).top(0).w(4).h(10).bg(c), div().absolute().left(0).top(3).w(10).h(4).bg(c)]);
+
 export default class Tabs extends View {
   init(_props, cx) {
     this.pressed = null;
     // `company-tabs.toggle-prs` (cmd+shift+r in keys.json) opens or closes the PR panel.
     if (!checking()) cx.spawn(async () => { for (;;) { if (await nextCommand() === "toggle-prs") this.togglePanel("prs"); } });
+    this.frame = 0; this.spin = false;
+    cx.timer.every(110, (cx) => { if (this.spin) { this.frame = (this.frame + 1) % 8; cx.notify(); } });
     this.scroll = ScrollHandle.new();
     try { this.panels = JSON.parse(localStorage.getItem("panels") ?? "{}"); } catch { this.panels = {}; }
     if (!this.panels || typeof this.panels !== "object" || Array.isArray(this.panels)) this.panels = {};
@@ -102,23 +138,25 @@ export default class Tabs extends View {
     const shown = space?.tabs ?? [];
     const active = shown.findIndex(tab => tab.active);
     const selected = shown[active]?.id;
+    this.spin = shown.some(tab => tab.status === "working");
     if (selected !== this.selected || active !== this.selectedIndex) {
       this.selected = selected;
       this.selectedIndex = active;
       if (active >= 0) this.scroll.scroll_to_item(active);
     }
     const stop = (_e, cx) => cx.stop_propagation();
-    const button = (id, label, action) => div().id(id).size(26).flex_none().flex().items_center().justify_center().rounded(6).text_color(t.dim).hover(s => s.bg(t.hover).text_color(t.foreground))
-      .on_mouse_down("left", stop).on_click(action).child(label);
+    const button = (id, glyph, action) => div().id(id).relative().size(28).flex_none().flex().items_center().justify_center()
+      .children(box(t.raised, t.chrome, t.surface)).font_family(MONO).font_bold().text_size(11).text_color(t.muted)
+      .hover(s => s.text_color(t.foreground))
+      .on_mouse_down("left", stop).on_click(action).child(glyph === "+" ? plus(t.accent) : glyph);
     const item = (c, i) => {
       const lead = panes().find(p => p.tab === c.id && p.program?.agent) ?? panes().find(p => p.tab === c.id);
       const program = lead?.program;
       const name = label(c, lead);
-      return h_flex().id(`tab-${c.id}`).h(29).px(10).gap(7).rounded(7).items_center().flex_none().text_size(12.8)
+      return h_flex().id(`tab-${c.id}`).relative().h(32).pl(9).pr(11).pt(4).pb(6).gap(7).items_center().flex_none()
+        .children([...box(c.active ? t.muted : t.raised, c.active ? t.raised : t.chrome, t.surface), ...(c.active ? [div().absolute().left(8).right(10).bottom(4).h(2).bg(t.accent)] : [])])
         // A rename or status dot on this or an earlier tab can push the active one out.
         .when(i <= active, el => el.on_size_change((_size, cx) => { this.scroll.scroll_to_item(active); cx.notify(); }))
-        .border(1).border_color(c.active ? t.border : t.chrome).bg(c.active ? t.raised : t.chrome).text_color(c.active ? t.foreground : t.muted)
-        .hover(s => s.bg(t.hover))
         .on_mouse_down("left", (e, cx) => { cx.stop_propagation(); this.pressed = i; if (e.click_count === 2) run("tab.rename", { id: c.id }); })
         .on_mouse_up("left", () => {
           const from = this.pressed; this.pressed = null;
@@ -126,11 +164,14 @@ export default class Tabs extends View {
           else run("tab.select", { id: c.id });
         })
         .on_mouse_down("right", (_e, cx) => { cx.stop_propagation(); openOverlay({ mod: "menu", kind: "popup", width: 200, props: { tab: "tab", target: { id: c.id, space: space.id } } }); })
-        .when(Boolean(program?.icon), el => el.child(program.tint ? svg(program.icon).size(14).text_color(t.muted) : image(program.icon).size(14)))
-        .child(div().max_w(170).truncate().child(c.zoomed ? `${name} Z` : name))
-        .when(c.status === "working", el => el.child(svg("mods/workspace-chrome/spinner.svg").size(12).flex_none().text_color(t.working).spin(900)))
-        .when(c.status === "blocked" || c.status === "done", el => el.child(div().size(6).rounded(3).bg(t[c.status])))
-        .when(c.active, el => el.child(div().id(`close-${c.id}`).text_color(t.dim).on_mouse_down("left", stop).on_click((_e, cx) => { cx.stop_propagation(); run("tab.close", { id: c.id }); }).child(svg("mods/pane/close.svg").size(12))));
+        .when(Boolean(program?.icon), el => el.child(program.tint ? svg(program.icon).size(14).text_color(c.active ? t.accent : t.muted) : image(program.icon).size(14)))
+        .child(div().max_w(170).truncate().font_family(MONO).font_bold().text_size(11).text_color(c.active ? t.foreground : t.muted).child(c.zoomed ? `${name} Z` : name))
+        .when(c.status === "working", el => el.child(spinner(t.working, this.frame)))
+        .when(c.status === "blocked", el => el.child(bang(t.blocked)))
+        .when(c.status === "done", el => el.child(tick(t.done)))
+        .when(c.active, el => el.child(div().id(`close-${c.id}`).flex_none().relative().w(8).h(8).cursor_pointer().on_mouse_down("left", stop)
+          .on_click((_e, cx) => { cx.stop_propagation(); run("tab.close", { id: c.id }); })
+          .children(cross(t.muted, 8))));
     };
     const root = layout(), sidebar = find(root, "sidebar"), w = window();
     // Old saved rails and a dragged-narrow sidebar can be smaller than the window buttons.
@@ -140,28 +181,30 @@ export default class Tabs extends View {
     const panel = find(root, "panel"), body = find(root, "panel-body");
     const enabled = [...(shared("workspace.panels") ?? ["files", "changes"]), ...(find(body, "prs") ? ["prs"] : [])];
     this.syncPanel(space, panel, body, enabled);
-    const panelButton = (id, label, icon) => {
+    const panelButton = (id, text) => {
       const on = panel && !panel.hidden && body?.active === id;
-      return h_flex().id(`panel-${id}`).h(26).px(8).gap(5).flex_none().items_center().rounded(6)
-        .text_size(12).bg(on ? t.selected : t.chrome).text_color(on ? t.foreground : t.muted)
-        .hover(s => s.bg(t.hover)).on_mouse_down("left", stop)
+      return h_flex().id(`panel-${id}`).relative().h(28).pl(9).pr(11).pt(4).pb(6).flex_none().items_center()
+        .children([...box(on ? t.muted : t.raised, on ? t.raised : t.chrome, t.surface), ...(on ? [div().absolute().left(8).right(10).bottom(4).h(2).bg(t.accent)] : [])])
+        .font_family(MONO).font_bold().text_size(10).text_color(on ? t.foreground : t.muted).hover(s => s.text_color(t.foreground))
+        .on_mouse_down("left", stop)
         .on_click(() => {
           if (on) run("layout.hide", { id: "panel" });
           else { run("layout.select", { stack: "panel-body", child: id }); run("layout.show", { id: "panel" }); }
-        }).child(svg(icon).size(14)).child(label);
+        })
+        .child(text.toUpperCase());
     };
-    return h_flex().size_full().min_w(0).px(10).pl(lightsPadding).gap(3).items_center().bg(t.chrome).border_b(1).border_color(t.border)
+    return h_flex().size_full().min_w(0).px(10).pl(lightsPadding).gap(3).items_center().bg(t.chrome).border_b(1).border_color(t.surface)
       .on_mouse_up("left", () => { this.pressed = null; })
       .on_scroll_wheel(e => this.wheel(e))
       .child(h_flex().id("tab-scroll").flex_1().min_w(0).h_full().items_center().gap(3).overflow_x_scrollbar().track_scroll(this.scroll)
         .on_size_change((_size, cx) => { if (active >= 0) { this.scroll.scroll_to_item(active); cx.notify(); } })
         .children(shown.map(item)))
       .child(button("tab-new", "+", () => openOverlay({ mod: "new-menu", kind: "popup", width: 250, height: 512 })))
-      .when(enabled.includes("files"), el => el.child(panelButton("files", "Files", "mods/files/file.svg")))
-      .when(enabled.includes("changes"), el => el.child(panelButton("changes", "Changes", "mods/changes/changes.svg")))
-      .when(enabled.includes("prs"), el => el.child(panelButton("prs", "PRs", "mods/company-tabs/prs.svg")))
-      .when(w?.buttons, el => el.child(button("minimize", w.platform === "windows" ? svg("mods/company-tabs/win-min.svg").size(16) : "−", () => run("window.minimize")))
-        .child(button("maximize", w.platform === "windows" ? svg(`mods/tabs/${w.maximized ? "win-restore" : "win-max"}.svg`).size(16) : "□", () => run("window.maximize")))
-        .child(button("close-window", w.platform === "windows" ? svg("mods/company-tabs/win-close.svg").size(16) : svg("mods/pane/close.svg").size(13), () => run("window.close"))));
+      .when(enabled.includes("files"), el => el.child(panelButton("files", "Files")))
+      .when(enabled.includes("changes"), el => el.child(panelButton("changes", "Changes")))
+      .when(enabled.includes("prs"), el => el.child(panelButton("prs", "PRs")))
+      .when(w?.buttons, el => el.child(button("minimize", w.platform === "windows" ? svg("mods/company-tabs/win-min.svg").size(14) : "−", () => run("window.minimize")))
+        .child(button("maximize", w.platform === "windows" ? svg(`mods/company-tabs/${w.maximized ? "win-restore" : "win-max"}.svg`).size(14) : "□", () => run("window.maximize")))
+        .child(button("close-window", w.platform === "windows" ? svg("mods/company-tabs/win-close.svg").size(14) : svg("mods/company-pane/close.svg").size(13), () => run("window.close"))));
   }
 }

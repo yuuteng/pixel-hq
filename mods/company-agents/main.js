@@ -3,10 +3,10 @@
 
 import { View, div, svg, image } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input } from "gpui-base";
-import { agents, terminals, panes, focused, spaces, run, theme, shared, setShared, setAgentOrder, openOverlay, closeOverlay, props, window, layout, appHome, exec, readTextFile, writeTextFile, nextCommand, hc, knownAgents } from "herdr";
+import { agents, terminals, panes, focused, spaces, run, theme, shared, setShared, setAgentOrder, settings, openOverlay, closeOverlay, props, window, layout, appHome, exec, readTextFile, writeTextFile, nextCommand, hc, knownAgents, checking } from "herdr";
 import { figureFor, load } from "./figures.js";
-import { agentOf, speciesOf, duckWidth, DUCK_CENTER, IDLE_SNOOZE, IDLE_URGE } from "./duck.js";
-import { scene, yHorizon } from "./scene.js";
+import { agentOf, speciesOf, duckWidth, duckMood, mood, DUCK_CENTER, IDLE_SNOOZE, IDLE_URGE } from "./duck.js";
+import { scene, sceneLayout, yHorizon } from "./scene.js";
 import { Editor } from "./editor.js";
 import { checkPixelHqUpdate, executePixelHqUpdate } from "./updater.js";
 import { snapshot, clashes, hire, agentTaskArgv } from "./crew.js";
@@ -20,7 +20,7 @@ const ticketIn = (text) => {
 const openTicket = (key) => { const base = ticketCfg().jira_url; if (base) exec("open", [`${base}/browse/${key}`]).catch(() => null); };
 
 // The figure editor, as a dialog; `space` opens it on that space's pick.
-const openFigures = (space) => openOverlay({ mod: "company-agents", kind: "dialog", width: 860, height: 640, props: { figures: true, ...(space ? { space } : {}) } });
+const openFigures = (space) => openOverlay({ mod: "company-agents", kind: "dialog", frame: "none", width: 860, height: 640, props: { figures: true, ...(space ? { space } : {}) } });
 
 function find(node, id) {
   if (node?.id === id) return node;
@@ -30,6 +30,16 @@ function find(node, id) {
   }
   return null;
 }
+
+const notch = (c, [l, r, t, b]) => [
+  div().absolute().left(l + 2).right(r + 2).top(t).bottom(b).bg(c),
+  div().absolute().left(l).right(r).top(t + 2).bottom(b + 2).bg(c),
+];
+const box = (frame, fill, shadow) => [
+  ...notch(shadow, [2, 0, 2, 0]),
+  ...notch(frame, [0, 2, 0, 2]),
+  ...notch(fill, [2, 4, 2, 4]),
+];
 
 // The sidebar's rail goes by its width, not a flag: dragging its edge narrows it too.
 const narrow = () => (find(layout(), "sidebar")?.size?.px ?? Infinity) < 160;
@@ -77,6 +87,32 @@ const sortOf = () => SORTS.find((s) => s.id === shared("agents.sort")) ?? SORTS[
 const SECTION = { 4: "Needs you", 3: "Done", 2: "Working", 1: "Idle" };
 const SECTION_STATUS = { 4: "blocked", 3: "done", 2: "working" };
 
+// How much is going on at each desk, from any agent that reports it: Hermes through its plugin, Claude Code through a hook
+// (see README). Interns: running sub-agents (agent.threads) plus the live child terminals the agent started with `hc run`
+// (each in its own species and mood). Runners and the server rack: shell work (agent.jobs: commands in flight plus background
+// processes). A job turns amber past a minute: agent.jobs_long says how many, or agent.jobs_started lists start times (ms)
+// for reporters that only run when a job starts or ends.
+function activityAll(all) {
+  return new Map(all.map((k) => {
+    const labels = k.labels ?? {};
+    const n = (v) => { const x = Number.parseInt(v, 10); return Number.isFinite(x) && x > 0 ? x : 0; };
+    const kids = all.filter((c) => c.parent === k.address && c.state === "live");
+    const interns = [
+      ...Array.from({ length: Math.min(n(labels["agent.threads"]), 50) }, () => ({ status: "working", species: speciesOf(progOf(k), tabNameOf(k)) })),
+      ...kids.map((c) => ({ status: String(c.status?.state ?? c.status ?? "idle"), species: speciesOf(progOf(c)) })),
+    ];
+    const jobs = Math.min(n(labels["agent.jobs"]), 99);
+    const now = Date.now();
+    const aged = String(labels["agent.jobs_started"] ?? "").split(",").filter((t) => { const ms = Number(t); return ms > 0 && now - ms > 60000; }).length;
+    return [k.address, { interns, jobs, long: Math.min(jobs, Math.max(n(labels["agent.jobs_long"]), aged)) }];
+  }));
+}
+
+// Today, for the plant and the clock: tasks shipped (an agent going from working to idle or done), time agents spent working, and
+// where. Kept by the office copy in localStorage and shared ("pixel-hq.today") for the clock's popup; it starts over each day.
+const dayKey = (d = new Date()) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+const freshDay = () => ({ day: dayKey(), shipped: 0, workMs: 0, bySpace: {} });
+
 function duration(ms) {
   const m = Math.floor(ms / 60000);
   if (m < 1) return "<1m";
@@ -87,8 +123,8 @@ function duration(ms) {
 
 function thinBar(t, pct, color, width) {
   const fill = pct > 0 ? Math.max(2, Math.round((width * pct) / 100)) : 0;
-  return div().w(width).h(3).flex_none().rounded(2).bg(t.border)
-    .child(div().h_full().rounded(2).bg(color).w(fill));
+  return div().w(width).h(3).flex_none().bg(t.border)
+    .child(div().h_full().bg(color).w(fill));
 }
 const hpColor = (t, pct) => (pct >= 80 ? t.ansi1 : pct >= 60 ? t.ansi3 : t.ansi2);
 const spColor = (t, left) => (left <= 10 ? t.ansi1 : left <= 30 ? t.ansi3 : "#89b4fa");
@@ -129,6 +165,8 @@ const progOf = (a) => {
   for (const item of pool) {
     if (!item) continue;
     const s = String(item).toLowerCase();
+    // Hermes first: it can run on a Claude or Codex model, and its argv may name one.
+    if (/hermes/.test(s)) return "hermes";
     if (/claude/.test(s)) return "claude";
     if (/antigravity|agy/.test(s)) return "antigravity";
     if (/opencode/.test(s)) return "opencode";
@@ -197,7 +235,7 @@ if not model:
       for line in open(cfg, "r", encoding="utf-8"):
         s = line.strip()
         if s.startswith("model =") or s.startswith("model="):
-          model = s.split("=", 1)[1].strip().strip("\"'")
+          model = s.split("=", 1)[1].strip().strip('"').strip("'")
           break
     except Exception: pass
 pct = None
@@ -287,7 +325,7 @@ const agyTranscriptVitals = async (cwd, machine) => {
 
 export default class Agents extends View {
   init(_props, cx) {
-    if (props()?.needsYou) return;
+    if (props()?.needsYou || props()?.workload || props()?.today) return;
     if (props()?.sortMenu) return;
     if (props()?.figures) { this.editor = new Editor(cx); return; }
     // Figure sets come from ~/.config/herdr-app/pond-agents.json; hand edits show within seconds.
@@ -298,6 +336,16 @@ export default class Agents extends View {
     });
     reload(cx);
     cx.timer.every(4000, reload);
+    // Names and roles set from a pane header (company-pane writes this file), shared for the desk labels.
+    const namesFile = `${appHome()}/pixel-hq-names.json`;
+    const loadNames = (cx) => cx.spawn(async (cx) => {
+      const raw = await readTextFile(namesFile).catch(() => null);
+      if (raw === this.namesRaw) return;
+      this.namesRaw = raw;
+      try { const v = JSON.parse(raw ?? "{}"); if (v && typeof v === "object") { setShared("pixel-hq.names", v); cx.notify(); } } catch {}
+    });
+    loadNames(cx);
+    cx.timer.every(3000, loadNames);
     this.folded = new Set();
     // Where the person dragged each pet: fractions of the panel, kept across restarts.
     try { this.petpos = JSON.parse(localStorage.getItem("petpos") ?? "{}"); } catch { this.petpos = {}; }
@@ -353,6 +401,10 @@ export default class Agents extends View {
     this.setupClaude(cx);
     this.setupAntigravity(cx);
     this.setupCodex(cx);
+    // Hermes Agent does not report a status either: give every Hermes home (~/.hermes and each profile) this mod's status plugin.
+    this.setupHermes(cx);
+    this.announceHermes(cx);
+    cx.timer.every(5000, (cx) => this.announceHermes(cx));
     checkPixelHqUpdate(true).then(() => cx.notify()).catch(() => {});
     cx.timer.every(6 * 3600 * 1000, (cx) => checkPixelHqUpdate(true).then(() => cx.notify()).catch(() => {}));
     // Now and then (every 14 to 32 s) one idle pet steps out beside its desk for about 3.6 s, then comes back.
@@ -380,6 +432,14 @@ export default class Agents extends View {
     });
     // Each agent's last state and when it changed (ms), kept across restarts.
     this.changed = JSON.parse(localStorage.getItem("changed") ?? "{}");
+    // The board's ticker: the last few things that happened (a desk shipped, a desk needs you), newest first.
+    try { this.events = JSON.parse(localStorage.getItem("events") ?? "[]"); } catch { this.events = []; }
+    if (!Array.isArray(this.events)) this.events = [];
+    try { this.today = JSON.parse(localStorage.getItem("today") ?? "null"); } catch { this.today = null; }
+    if (!this.today || this.today.day !== dayKey()) this.today = freshDay();
+    if (JSON.stringify(shared("pixel-hq.today")) !== JSON.stringify(this.today)) setShared("pixel-hq.today", this.today);
+    // The clock on the wall and the sky in the windows: one redraw a minute.
+    cx.timer.every(60000, (cx) => cx.notify());
     try { this.seen = JSON.parse(localStorage.getItem("seen") ?? "{}"); } catch { this.seen = {}; }
     try { this.settled = new Set(JSON.parse(localStorage.getItem("settled") ?? "[]")); } catch { this.settled = new Set(); }
     this.watching = null;
@@ -395,7 +455,10 @@ export default class Agents extends View {
     let dirty = false;
     for (const a of list) {
       const s = a.status === "done" ? "idle" : a.status;
-      if (this.changed[a.address]?.s === s) continue;
+      const prev = this.changed[a.address];
+      if (prev?.s === s) continue;
+      if (prev?.s === "working") this.tally(a, s, prev.at, now);
+      if (prev && (s === "blocked" || (prev.s === "working" && s === "idle"))) this.logEvent(a, s === "blocked" ? "needs" : "shipped", now);
       this.changed[a.address] = { s, at: now };
       dirty = true;
     }
@@ -407,6 +470,26 @@ export default class Agents extends View {
     try { localStorage.setItem("changed", JSON.stringify(this.changed)); } catch { /* storage blocked: the shared stamps still carry for this session */ }
     // The floor copy and the needs-you popup are separate copies with separate storage: share the stamps so the popup sorts truthfully.
     setShared("pixel-hq.changed", this.changed);
+  }
+
+  logEvent(a, kind, at) {
+    const who = String(a.space_name || a.program?.name || a.address).toUpperCase(), prog = String(a.program?.name || "").toUpperCase();
+    this.events = [{ who, prog, kind, at, addr: a.address }, ...this.events].slice(0, 6);
+    try { localStorage.setItem("events", JSON.stringify(this.events)); } catch { /* storage blocked: kept in memory */ }
+  }
+
+  // An agent stopped working: add its time to today (counted from midnight at most, six hours at most) and, if it finished
+  // rather than waiting on you, one task shipped.
+  tally(a, s, from, now) {
+    if (!this.today || this.today.day !== dayKey()) this.today = freshDay();
+    const midnight = new Date(); midnight.setHours(0, 0, 0, 0);
+    const ms = Math.max(0, Math.min(6 * 3600000, now - Math.max(from, midnight.getTime())));
+    this.today.workMs += ms;
+    const where = a.space_name || "?";
+    this.today.bySpace[where] = (this.today.bySpace[where] ?? 0) + ms;
+    if (s === "idle") this.today.shipped += 1;
+    try { localStorage.setItem("today", JSON.stringify(this.today)); } catch { /* storage blocked: kept in memory */ }
+    setShared("pixel-hq.today", this.today);
   }
 
   // Keep offline pins until their terminal returns, and keep each pending until
@@ -467,28 +550,66 @@ export default class Agents extends View {
 
   sortMenu(t) {
     const on = sortOf().id;
-    return v_flex()
-      .w_full()
-      .p(5)
-      .bg(t.popover)
-      .text_size(12.8)
-      .child(div().px(8).pt(4).pb(6).text_size(11).text_color(t.dim).child("Sort agents"))
-      .children(SORTS.map((s) => h_flex()
-        .id(`sort-${s.id}`)
-        .h(31)
-        .px(8)
-        .gap(9)
-        .rounded(7)
-        .items_center()
-        .text_color(t.foreground)
-        .hover((el) => el.bg(t.hover))
-        .on_click(() => {
-          setShared("agents.sort", s.id);
-          closeOverlay(props().overlay);
-        })
-        .child(svg(`mods/workspace-chrome/${s.icon}.svg`).size(14).flex_none().text_color(t.muted))
-        .child(div().flex_1().child(s.label))
-        .when(s.id === on, (el) => el.child(svg("mods/workspace-chrome/check.svg").size(14).flex_none().text_color(t.foreground)))));
+    return div()
+      .relative()
+      .w(200)
+      .children(box("#45475a", "#181825", "#11111b"))
+      .child(
+        v_flex()
+          .relative()
+          .p(6)
+          .font_family("JetBrains Mono")
+          .text_size(11)
+          .child(
+            h_flex()
+              .px(6)
+              .pt(2)
+              .pb(4)
+              .border_b(1)
+              .border_color("#313244")
+              .justify_between()
+              .items_center()
+              .child(div().font_bold().text_size(10).text_color(t.dim).child("SORT AGENTS"))
+              .child(
+                h_flex()
+                  .relative()
+                  .h(20)
+                  .px(6)
+                  .items_center()
+                  .justify_center()
+                  .cursor_pointer()
+                  .children(box("#45475a", "#313244", "#11111b"))
+                  .hover((s) => s.text_color("#ffffff"))
+                  .on_click(() => closeOverlay(props().overlay))
+                  .child(div().font_family("JetBrains Mono").text_size(8.5).font_bold().text_color("#a6adc8").child("ESC"))
+              )
+          )
+          .child(
+            v_flex()
+              .py(2)
+              .gap(2)
+              .children(
+                SORTS.map((s) =>
+                  h_flex()
+                    .id(`sort-${s.id}`)
+                    .h(28)
+                    .px(8)
+                    .gap(8)
+                    .items_center()
+                    .cursor_pointer()
+                    .text_color(t.foreground)
+                    .hover((el) => el.bg("#313244"))
+                    .on_click(() => {
+                      setShared("agents.sort", s.id);
+                      closeOverlay(props().overlay);
+                    })
+                    .child(svg(`mods/company-agents/${s.icon}.svg`).size(13).flex_none().text_color(t.muted))
+                    .child(div().flex_1().child(s.label.toUpperCase()))
+                    .when(s.id === on, (el) => el.child(div().size(6).bg(t.accent)))
+                )
+              )
+          )
+      );
   }
 
   needsYou(t) {
@@ -517,38 +638,80 @@ export default class Agents extends View {
       const label = tab ? title(many ? { ...tab, named: false } : tab, many ? a : leads.get(a.tab)) : (clean(a.title) || a.program?.name || a.tab_name || a.address);
       return /^\d+$/.test(label) ? (a.program?.name || label) : label;
     };
-    return v_flex()
-      .w_full()
-      .p(6)
-      .bg(t.popover)
-      .overflow_y_scrollbar()
-      .child(h_flex().px(6).pt(2).pb(6).gap(8).items_center()
-        .child(div().font_family(mono).font_bold().text_size(10).text_color("#f9e2af").child("NEEDS YOU"))
-        .when(waiting.length > 0, (el) => el.child(div().text_size(10).text_color(t.dim).child(`${waiting.length} waiting · longest first`))))
-      .when(waiting.length === 0, (el) => el.child(div().px(10).py(18).text_size(12).text_color(t.dim).child("All hands on deck. Nobody needs you right now.")))
-      .children(waiting.map((a) => {
-        const at = stamp(a);
-        const name = nameOf(a);
-        const sub = [a.space_name, a.program?.name, at ? `waiting ${duration(now - at)}` : null].filter(Boolean).join(" · ");
-        return h_flex()
-          .id(`ny-${a.address}`)
-          .h(52)
-          .px(6)
-          .gap(8)
-          .rounded(8)
-          .items_center()
-          .cursor_pointer()
-          .hover((s) => s.bg(t.hover))
-          .on_click(() => {
-            run("pane.focus", { pane: a.pane });
-            closeOverlay(props().overlay);
-          })
-          .child(div().flex_none().child(figureFor(a.space_name, "blocked", 34, at ? Math.max(0, now - at) : 0, speciesOf(progOf(a), tabNameOf(a)))))
-          .child(v_flex().flex_1().min_w(0).gap(1)
-            .child(div().truncate().text_size(12.5).text_color(t.foreground).child(name))
-            .child(div().truncate().text_size(10.5).text_color(t.muted).child(sub)))
-          .child(div().flex_none().text_size(14).text_color("#89b4fa").child("→"));
-      }));
+    const h = Math.min(440, Math.max(150, 52 + waiting.length * 56));
+    return div()
+      .relative()
+      .w(340)
+      .h(h)
+      .children(box("#45475a", "#181825", "#11111b"))
+      .child(
+        v_flex()
+          .relative()
+          .size_full()
+          .p(8)
+          .gap(6)
+          .font_family(mono)
+          .child(
+            h_flex()
+              .h(28)
+              .px(6)
+              .pb(4)
+              .border_b(1)
+              .border_color("#313244")
+              .items_center()
+              .justify_between()
+              .child(
+                h_flex().gap(6).items_center()
+                  .child(div().font_family(mono).font_bold().text_size(11).text_color("#f9e2af").child("NEEDS YOU"))
+                  .when(waiting.length > 0, (el) => el.child(div().text_size(9.5).text_color(t.dim).child(`(${waiting.length})`)))
+              )
+              .child(
+                h_flex()
+                  .relative()
+                  .h(20)
+                  .px(6)
+                  .items_center()
+                  .justify_center()
+                  .cursor_pointer()
+                  .children(box("#45475a", "#313244", "#11111b"))
+                  .hover((s) => s.text_color("#ffffff"))
+                  .on_click(() => closeOverlay(props()?.overlay))
+                  .child(div().text_size(9).font_bold().text_color("#a6adc8").child("ESC"))
+              )
+          )
+          .child(
+            v_flex()
+              .flex_1()
+              .min_h(0)
+              .overflow_y_scrollbar()
+              .gap(4)
+              .when(waiting.length === 0, (el) => el.child(div().px(10).py(18).text_size(11.5).text_color(t.dim).child("All hands on deck. Nobody needs you right now.")))
+              .children(waiting.map((a) => {
+                const at = stamp(a);
+                const name = nameOf(a);
+                const sub = [a.space_name, a.program?.name, at ? `waiting ${duration(now - at)}` : null].filter(Boolean).join(" · ");
+                return h_flex()
+                  .id(`ny-${a.address}`)
+                  .relative()
+                  .h(50)
+                  .px(6)
+                  .gap(8)
+                  .items_center()
+                  .cursor_pointer()
+                  .children(box("#313244", "#1e1e2e", "#11111b"))
+                  .hover((s) => s.bg("#313244"))
+                  .on_click(() => {
+                    run("pane.focus", { pane: a.pane });
+                    closeOverlay(props()?.overlay);
+                  })
+                  .child(div().flex_none().child(figureFor(a.space_name, "blocked", 34, at ? Math.max(0, now - at) : 0, speciesOf(progOf(a), tabNameOf(a)))))
+                  .child(v_flex().flex_1().min_w(0).gap(1)
+                    .child(div().truncate().font_family(mono).font_bold().text_size(11.5).text_color(t.foreground).child(name))
+                    .child(div().truncate().font_family(mono).text_size(9.5).text_color(t.muted).child(sub)))
+                  .child(div().flex_none().font_family(mono).font_bold().text_size(12).text_color("#89b4fa").child("→"));
+              }))
+          )
+      );
   }
 
   peek(addr) {
@@ -617,7 +780,6 @@ export default class Agents extends View {
       .id(`sub-${k.address}`)
       .pl(44)
       .pr(8)
-      .rounded(8)
       .h(34)
       .flex_none()
       .gap(0)
@@ -628,7 +790,7 @@ export default class Agents extends View {
       .on_click(() => (this.listed.has(k.address) ? run("pane.focus", { terminal: k.address }) : this.peek(k.address)))
       .children(s.lines.map(l => div().self_start().mt(-4).w(9).h(17).mr(4).flex_none()
         .when(Boolean(l), el => el.border_l(1.5).border_color(t.input))
-        .when(l === "└" || l === "├", el => el.border_b(1.5).rounded_bl(6))))
+        .when(l === "└" || l === "├", el => el.border_b(1.5))))
       .child(div().mr(6).child(pic))
       .child(div().flex_1().truncate().text_color(on ? t.foreground : t.muted).child(k.name || k.template || k.program?.name || k.address))
       .child(this.status(t, { status: st }, compact));
@@ -637,12 +799,12 @@ export default class Agents extends View {
   // compact: a ! for blocked where a header already says "Needs you".
   status(t, a, compact = false) {
     const color = t[a.status] ?? t.dim;
-    if (a.status === "working") return svg("mods/workspace-chrome/spinner.svg").size(12).mx(1).flex_none().text_color(t.working).spin(900);
-    if (a.status === "blocked" && compact) return div().size(14).flex_none().rounded(4).bg(t.blocked + "26").text_size(10.5).font_bold().text_color(t.blocked).flex().items_center().justify_center().child("!");
-    if (a.status === "blocked") return div().flex_none().px(6).h(18).rounded(5).bg(t.blocked + "26").text_size(10.5).font_semibold().text_color(t.blocked).flex().items_center().child("Needs you");
+    if (a.status === "working") return svg("mods/company-agents/pixel-spinner.svg").size(12).mx(1).flex_none().text_color(t.working).spin(900);
+    if (a.status === "blocked" && compact) return div().size(14).flex_none().border(1).border_color(t.blocked + "88").bg(t.blocked + "26").text_size(9).font_bold().font_family("JetBrains Mono").text_color(t.blocked).flex().items_center().justify_center().child("!");
+    if (a.status === "blocked") return div().flex_none().px(6).h(18).border(1).border_color(t.blocked + "88").bg(t.blocked + "26").text_size(9.5).font_bold().font_family("JetBrains Mono").text_color(t.blocked).flex().items_center().child("NEEDS YOU");
     // Idle: a ring; done: a dot.
-    if (a.status === "idle") return div().size(7).mx(3).flex_none().rounded(4).border(1.5).border_color(t.idle ?? t.dim);
-    return div().size(7).mx(3).flex_none().rounded(4).bg(a.status === "done" ? color : t.dim + "00");
+    if (a.status === "idle") return div().size(6).mx(3).flex_none().border(1).border_color(t.idle ?? t.dim);
+    return div().size(6).mx(3).flex_none().bg(a.status === "done" ? color : "transparent");
   }
 
   async scan(cx) {
@@ -778,9 +940,243 @@ export default class Agents extends View {
     return value;
   }
 
+  // Clickable spots over the wall, at the places sceneLayout() gives the drawing.
+  sceneSpots(sz, everyone, o) {
+    const Lo = sceneLayout(sz.width, sz.height);
+    const spot = (id, x, y, w, h, tip, act) => div().id(id).absolute().left(x).top(y).w(w).h(h).cursor_pointer().tooltip(tip)
+      .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+      .on_click((_e, cx) => { cx.stop_propagation(); act(cx); });
+    const word = { working: "at work", blocked: "needs you", done: "shipped", idle: "quiet" };
+    const out = [];
+    Lo.buildings.forEach((b, k) => {
+      const sp = o.spaces[k];
+      if (sp) out.push(spot(`bld-${sp.id}`, b.x, b.y - 4, b.w, b.h + 4, `${sp.name} · ${word[sp.status] ?? "quiet"}${sp.active ? " · you are here" : " · click to go there"}`,
+        () => run("space.select", { id: sp.id })));
+    });
+    const openToday = () => openOverlay({ mod: "company-agents", kind: "popup", frame: "none", width: 300, height: 214, props: { today: true } });
+    out.push(spot("wall-clock", Lo.cx - Lo.rr, Lo.cy - Lo.rr, Lo.rr * 2, Lo.rr * 2, "Today: tasks shipped, time at work, busiest floor", openToday));
+    if (!Lo.sign && o.needYou > 0) out.push(spot("wall-badge", Lo.cx + Lo.rr - 6, Lo.cy + Lo.rr - 8, 12, 10,
+      `${o.needYou} ${o.needYou > 1 ? "agents need" : "agent needs"} you · click to see who`, () => this.openNeedsYou()));
+    if (Lo.board) out.push(this.wallBoard(Lo.board, o, spot));
+    if (Lo.sign && o.needYou) out.push(spot("wall-sign", Lo.sign.x, Lo.sign.y, Lo.sign.w, Lo.sign.h,
+      o.needYou ? `${o.needYou} ${o.needYou > 1 ? "agents need" : "agent needs"} you · click to see who` : "Nobody needs you right now", () => this.openNeedsYou()));
+    out.push(spot("wall-rack", Lo.rackX, Lo.rackTop, Lo.rackCab, Lo.base - Lo.rackTop,
+      o.load ? `${o.load} running across the office (sub-agents and shell jobs) · click for the list` : "Nothing running in the background · click for the list", () => this.openWorkload()));
+    const done = everyone.filter((a) => a.status === "done" && !this.settled.has(a.address));
+    out.push(spot("wall-cooler", Lo.cooler.x, Lo.cooler.y, Lo.cooler.w, Lo.cooler.h,
+      done.length ? `Break room: send ${done.length} finished staff on a break` : "Break room: nobody has finished a task", (cx) => {
+        for (const a of done) this.settled.add(a.address);
+        try { localStorage.setItem("settled", JSON.stringify([...this.settled])); } catch { /* storage disabled: settled until restart */ }
+        cx.notify();
+      }));
+    out.push(spot("wall-plant", Lo.plant.x, Lo.plant.y, Lo.plant.w, Lo.plant.h,
+      `${o.shipped} task${o.shipped === 1 ? "" : "s"} shipped today${o.droop ? " · drooping: someone has waited on you for over 5 minutes" : ""}`, openToday));
+    return out;
+  }
+
+  // The board under the windows: a fuel gauge for the lowest usage window left, and an amber dot-matrix panel cycling through
+  // what just happened, today's score and any context running full. Red, and still, while someone needs you. Native frames only.
+  wallBoard(B, o, spot) {
+    const d = o.board ?? {}, now = Date.now();
+    const ago = (t) => { const m = Math.max(0, Math.round((now - t) / 60000)); return m < 1 ? "NOW" : m < 60 ? `${m}M` : `${Math.floor(m / 60)}H`; };
+    const hm = (ms) => { const m = Math.round(ms / 60000); return m < 60 ? `${m}M` : `${Math.floor(m / 60)}H${String(m % 60).padStart(2, "0")}M`; };
+    const fuel = d.fuel?.[0] ?? null;
+    const gw = fuel ? 24 : 0, tx = B.x + gw + 5, tw = B.w - gw - 8;
+    const fit = Math.max(8, Math.floor((tw - 2) / 4.55));
+    const needs = o.needYou > 0;
+    const panels = needs
+      ? [`! ${[...new Set(d.blocked ?? [])].filter(Boolean).join(", ") || `${o.needYou}`} NEED${o.needYou > 1 ? "" : "S"} YOU`]
+      : [
+          ...(d.events ?? []).filter((e) => now - e.at < 6 * 3600000).slice(0, 3).map((e) => `${e.who} ${e.kind === "shipped" ? "SHIPPED" : "WAITED"} ${ago(e.at)}`),
+          `${o.shipped ?? 0} SHIPPED TODAY`,
+          ...((d.workMs ?? 0) >= 60000 ? [`${hm(d.workMs)} AT WORK`] : []),
+          ...(d.hot ?? []).slice(0, 2).map((h) => `${h.who} CONTEXT ${h.p}%`),
+          ...(o.load ? [`${o.load} HELPER${o.load > 1 ? "S" : ""} AT WORK`] : []),
+        ];
+    // Short panels hold for 3 s; long ones scroll through once, then hold. 250 ms a frame.
+    const frames = [];
+    for (const raw of panels) {
+      const t = raw.replace(/\s+/g, " ").trim();
+      if (t.length <= fit) { for (let i = 0; i < 12; i++) frames.push(t); continue; }
+      const head = t.slice(0, fit);
+      for (let i = 0; i < 6; i++) frames.push(head);
+      for (let i = 1; i <= t.length - fit; i++) frames.push(t.slice(i, i + fit));
+      for (let i = 0; i < 6; i++) frames.push(t.slice(t.length - fit));
+    }
+    const ink = needs ? "#f38ba8" : "#f9b84a";
+    const text = div().absolute().left(tx).top(B.y + 3).w(tw).h(B.h - 6).overflow_hidden().flex().items_center()
+      .font_family("JetBrains Mono").font_bold().text_size(7.5).text_color(ink);
+    const shown = frames.length > 1 ? text.frames(frames.slice(0, 600), 250) : text.child(frames[0] ?? "");
+    const fc = fuel ? (fuel.q <= 10 ? "#f38ba8" : fuel.q <= 25 ? "#f9b84a" : "#a6e3a1") : null;
+    const gauge = fuel ? [
+      // five segments, 20% each
+      ...Array.from({ length: 5 }, (_, i) => {
+        const lit = i < Math.ceil(fuel.q / 20);
+        const seg = div().absolute().left(B.x + 3 + i * 4).top(B.y + 4).w(3).h(B.h - 8).bg(lit ? fc : "#2a2e48");
+        return lit && fuel.q <= 10 ? seg.loop("opacity", { from: 0.3, to: 1, period: 700, easing: "ease-in-out" }) : seg;
+      }),
+      div().absolute().left(B.x + gw + 1).top(B.y + 3).w(1).h(B.h - 6).bg("#2e3250"),
+    ] : [];
+    const fuelTip = (d.fuel ?? []).map((f) => `${f.who} ${f.q}% left${f.reset ? ` (resets ${new Date(f.reset).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })})` : ""}`).join(" · ");
+    const tip = [...panels.map((p) => p.charAt(0) + p.slice(1).toLowerCase()), fuelTip ? `Usage window: ${fuelTip}` : null].filter(Boolean).join("\n");
+    const board = div().absolute().left(0).top(0).w(B.x + B.w + 4).h(B.y + B.h + 4)
+      // the bezel, a dark face with faint scanlines, two bolts
+      .child(div().absolute().left(B.x - 2).top(B.y - 2).w(B.w + 4).h(B.h + 4).bg("#0a0c1a"))
+      .child(div().absolute().left(B.x).top(B.y).w(B.w).h(B.h).bg("#14110c").border_1().border_color(needs ? "#5a2234" : "#3a2f1c"))
+      .when(needs, (el) => el.child(div().absolute().left(B.x - 2).top(B.y - 2).w(B.w + 4).h(B.h + 4).border_1().border_color("#f38ba8")
+        .loop("opacity", { from: 0.2, to: 1, period: 900, easing: "ease-in-out" })))
+      .children(gauge)
+      .child(shown)
+      .children([4, 8, 12].map((y) => div().absolute().left(B.x + 1).top(B.y + y).w(B.w - 2).h(1).bg("#00000033")))
+      .child(div().absolute().left(B.x + 1).top(B.y - 5).w(2).h(2).bg("#6b7194"))
+      .child(div().absolute().left(B.x + B.w - 3).top(B.y - 5).w(2).h(2).bg("#6b7194"));
+    const openToday = () => openOverlay({ mod: "company-agents", kind: "popup", frame: "none", width: 300, height: 214, props: { today: true } });
+    return spot("wall-board", B.x - 2, B.y - 6, B.w + 4, B.h + 8, tip, () => (needs ? this.openNeedsYou() : openToday()))
+      .child(board.left(-(B.x - 2)).top(-(B.y - 6)));
+  }
+
+  openWorkload() {
+    const act = activityAll(terminals());
+    const n = agents().filter((a) => { const x = act.get(a.address); return x && (x.interns.length || x.jobs); }).length;
+    openOverlay({ mod: "company-agents", kind: "popup", frame: "none", width: 340, height: Math.min(440, Math.max(150, 52 + n * 56)), props: { workload: true } });
+  }
+
+  // The rack's list: every desk with sub-agents or shell jobs running, busiest first; a click shows that agent.
+  workloadView(t) {
+    const act = activityAll(terminals());
+    const load = (x) => x.interns.length + x.jobs;
+    const rows = agents().map((a) => ({ a, x: act.get(a.address) })).filter(({ x }) => x && load(x) > 0).sort((p, q) => load(q.x) - load(p.x));
+    const total = rows.reduce((n, { x }) => n + load(x), 0);
+    const mono = "JetBrains Mono";
+    const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
+    const h = Math.min(440, Math.max(150, 52 + rows.length * 56));
+    return div()
+      .relative()
+      .w(340)
+      .h(h)
+      .children(box("#45475a", "#181825", "#11111b"))
+      .child(
+        v_flex()
+          .relative()
+          .size_full()
+          .p(8)
+          .gap(6)
+          .font_family(mono)
+          .child(
+            h_flex()
+              .h(28)
+              .px(6)
+              .pb(4)
+              .border_b(1)
+              .border_color("#313244")
+              .items_center()
+              .justify_between()
+              .child(
+                h_flex().gap(6).items_center()
+                  .child(div().font_family(mono).font_bold().text_size(11).text_color("#a6e3a1").child("SERVER RACK"))
+                  .when(rows.length > 0, (el) => el.child(div().text_size(9.5).text_color(t.dim).child(`(${total} running)`)))
+              )
+              .child(
+                h_flex()
+                  .relative()
+                  .h(20)
+                  .px(6)
+                  .items_center()
+                  .justify_center()
+                  .cursor_pointer()
+                  .children(box("#45475a", "#313244", "#11111b"))
+                  .hover((s) => s.text_color("#ffffff"))
+                  .on_click(() => closeOverlay(props()?.overlay))
+                  .child(div().text_size(9).font_bold().text_color("#a6adc8").child("ESC"))
+              )
+          )
+          .child(
+            v_flex()
+              .flex_1()
+              .min_h(0)
+              .overflow_y_scrollbar()
+              .gap(4)
+              .when(rows.length === 0, (el) => el.child(div().px(10).py(18).text_size(11.5).text_color(t.dim).child("Quiet: no sub-agents or shell jobs running.")))
+              .children(rows.map(({ a, x }) => {
+                const parts = [x.interns.length ? plural(x.interns.length, "sub-agent") : null, x.jobs ? `${plural(x.jobs, "shell job")}${x.long ? ` (${x.long} over a minute)` : ""}` : null].filter(Boolean).join(" · ");
+                return h_flex().id(`wl-${a.address}`).relative().h(52).px(6).gap(8).items_center().cursor_pointer()
+                  .children(box("#313244", "#1e1e2e", "#11111b"))
+                  .hover((st) => st.bg("#313244"))
+                  .on_click(() => { run("agent.focus", { terminal: a.address }); closeOverlay(props().overlay); })
+                  .child(div().flex_none().child(figureFor(a.space_name, a.status, 34, 0, speciesOf(progOf(a), tabNameOf(a)))))
+                  .child(v_flex().flex_1().min_w(0).gap(1)
+                    .child(div().truncate().font_family(mono).font_bold().text_size(11.5).text_color(t.foreground).child([a.space_name, a.program?.name].filter(Boolean).join(" · ")))
+                    .child(div().truncate().font_family(mono).text_size(9.5).text_color(t.muted).child(parts)))
+                  .child(div().flex_none().font_family(mono).font_bold().text_size(12).text_color("#89b4fa").child("→"));
+              }))
+          )
+      );
+  }
+
+  // The clock's summary of the day.
+  todayView(t) {
+    const raw = shared("pixel-hq.today");
+    const d = raw && raw.day === dayKey() ? raw : freshDay();
+    const top = Object.entries(d.bySpace ?? {}).sort((p, q) => q[1] - p[1])[0];
+    const list = agents();
+    const mono = "JetBrains Mono";
+    const hm = (ms) => { const m = Math.round(ms / 60000); return m < 60 ? `${m}m` : `${Math.floor(m / 60)}h ${m % 60}m`; };
+    const day = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"][new Date().getDay()];
+    const line = (label, value) => h_flex().justify_between().px(10).py(4)
+      .child(div().text_size(11.5).text_color(t.muted).child(label))
+      .child(div().text_size(12).font_family(mono).font_bold().text_color(t.foreground).child(value));
+    return div()
+      .relative()
+      .w(300)
+      .children(box("#45475a", "#181825", "#11111b"))
+      .child(
+        v_flex()
+          .relative()
+          .p(8)
+          .gap(4)
+          .font_family(mono)
+          .child(
+            h_flex()
+              .h(28)
+              .px(6)
+              .pb(4)
+              .border_b(1)
+              .border_color("#313244")
+              .items_center()
+              .justify_between()
+              .child(
+                h_flex().gap(6).items_center()
+                  .child(div().font_family(mono).font_bold().text_size(11).text_color("#f9e2af").child("TODAY STATS"))
+                  .child(div().text_size(9.5).text_color(t.dim).child(`${day} ${d.day}`))
+              )
+              .child(
+                h_flex()
+                  .relative()
+                  .h(20)
+                  .px(6)
+                  .items_center()
+                  .justify_center()
+                  .cursor_pointer()
+                  .children(box("#45475a", "#313244", "#11111b"))
+                  .hover((s) => s.text_color("#ffffff"))
+                  .on_click(() => closeOverlay(props()?.overlay))
+                  .child(div().text_size(9).font_bold().text_color("#a6adc8").child("ESC"))
+              )
+          )
+          .child(
+            v_flex().gap(2).pt(2)
+              .child(line("Tasks shipped", String(d.shipped)))
+              .child(line("Time agents worked", hm(d.workMs)))
+              .child(line("Busiest floor", top ? `${top[0]} · ${hm(top[1])}` : "none yet"))
+              .child(line("Working now", String(list.filter((a) => a.status === "working").length)))
+              .child(line("Waiting on you", String(list.filter((a) => a.status === "blocked").length)))
+          )
+      );
+  }
+
   openNeedsYou() {
     const n = agents().filter((a) => a.status === "blocked").length;
-    openOverlay({ mod: "company-agents", kind: "popup", width: 340, height: Math.min(440, Math.max(150, 52 + n * 56)), props: { needsYou: true } });
+    openOverlay({ mod: "company-agents", kind: "popup", frame: "none", width: 340, height: Math.min(440, Math.max(150, 52 + n * 56)), props: { needsYou: true } });
   }
 
   openHire(cx) {
@@ -804,7 +1200,7 @@ export default class Agents extends View {
     cx.notify();
     try {
       const { path, branch } = await hire(exec, { ticket: this.ticketInput.value(), repo: this.repoInput.value() });
-      const argv = { claude: ["claude"], codex: ["codex"], opencode: ["opencode"], agy: ["agy"] }[h.program] ?? [h.program];
+      const argv = { claude: ["claude"], codex: ["codex"], opencode: ["opencode"], agy: ["agy"], hermes: ["hermes"] }[h.program] ?? [h.program];
       run("tab.new", { name: branch, folder: path, argv, space: spaces().find((x) => x.active)?.id });
       h.open = false;
       this.ticketInput.set_value("");
@@ -899,6 +1295,40 @@ export default class Agents extends View {
     localStorage.setItem("oc-hp-plugin", "1");
     if (r.code === 0) { this.notice = "OpenCode HP plugin added"; cx.notify(); }
     if (r.code === 5) { this.notice = "OpenCode HP plugin updated"; cx.notify(); }
+  }
+
+  // Hermes loads user plugins from <home>/plugins and runs only the ones listed in that home's config.yaml, per home: ~/.hermes and
+  // every ~/.hermes/profiles/<name>. For each, once: copy hermes-status/ to plugins/pixel-hq-status and enable it with Hermes' own CLI.
+  // Later launches only refresh Pixel HQ's own older copy (never re-enable it). A home where it was installed and then deleted
+  // keeps a tombstone (.pixel-hq-status-installed) and is left alone for good. Each home with the plugin also gets HC_TERMINAL_ID
+  // in terminal.client_env_passthrough, once, so `hermes --tui` sessions (run by a shared host with no terminal) know their terminal.
+  // The steps are in hermes-setup.sh. Unix only; Hermes reads all of it on its next start.
+  async setupHermes(cx) {
+    if (checking() || window()?.platform === "windows") return; // a check must not touch ~/.hermes
+    const dir = `${appHome()}/mods/company-agents`;
+    const r = await exec("sh", [`${dir}/hermes-setup.sh`, `${dir}/hermes-status`], { timeout: 300000 }).catch(() => null);
+    if (!r || r.code !== 0) return; // no Hermes here: nothing to do
+    const [added, updated, , tui] = r.stdout.trim().split(/\s+/).map((n) => parseInt(n, 10) || 0);
+    if (added) { this.notice = `Hermes status plugin added${added > 1 ? ` to ${added} homes` : ""} · restart Hermes to get a desk`; cx.notify(); }
+    else if (updated || tui) { this.notice = "Hermes status plugin updated · restart Hermes, and `hermes gateway restart` for the TUI"; cx.notify(); }
+  }
+
+  // `hermes --tui` runs its agent in a background host, so nothing reports until the first message. Give such a terminal its desk
+  // at launch: hermes-announce.sh writes `idle` to the tty of a live local terminal whose foreground program is Hermes and that has
+  // no status yet. Each terminal is tried at most every 30 s; never one on another machine.
+  announceHermes(cx) {
+    if (checking() || window()?.platform === "windows") return;
+    const now = Date.now();
+    this.hermesTried ??= new Map();
+    const due = terminals().filter((t) => {
+      if (t.state !== "live" || t.status || String(t.address).includes("/")) return false;
+      // The process name, not argv: `vim ~/.hermes/config.yaml` must not get a desk.
+      return t.foreground?.name === "hermes" && now - (this.hermesTried.get(t.address) ?? 0) > 30000;
+    });
+    if (!due.length) return;
+    for (const t of due) this.hermesTried.set(t.address, now);
+    const script = `${appHome()}/mods/company-agents/hermes-announce.sh`;
+    cx.spawn(async () => { await exec("sh", [script, ...due.map((t) => String(t.address))], { timeout: 15000 }).catch(() => null); });
   }
 
   async setupClaude(cx) {
@@ -1112,6 +1542,8 @@ export default class Agents extends View {
     const t = theme();
     if (props()?.sortMenu) return this.sortMenu(t);
     if (props()?.needsYou) return this.needsYou(t);
+    if (props()?.workload) return this.workloadView(t);
+    if (props()?.today) return this.todayView(t);
     if (this.editor) return this.editor.render(cx);
     const dismissed = shared("pixel-hq.dismissed-version") || localStorage.getItem("upd-dismissed");
     if (this.update && dismissed === String(this.update.version)) {
@@ -1120,6 +1552,7 @@ export default class Agents extends View {
     const collapsed = narrow();
     const sort = sortOf();
     let list = agents();
+    const everyone = list;
     const blockedAll = list.filter((a) => a.status === "blocked");
     let settleDirty = false;
     for (const a of list) if ((a.status === "working" || a.status === "blocked") && this.settled.delete(a.address)) settleDirty = true;
@@ -1176,7 +1609,6 @@ export default class Agents extends View {
         .gap(3)
         .flex()
         .items_center()
-        .rounded(4)
         .text_size(11)
         .text_color(open ? t.dim : (t[top] ?? t.dim))
         .cursor_pointer()
@@ -1186,7 +1618,7 @@ export default class Agents extends View {
           open ? this.folded.add(a.address) : this.folded.delete(a.address);
           cx.notify();
         })
-        .child(svg(`mods/workspace-chrome/chevron-${open ? "down" : "right"}.svg`).size(11).flex_none())
+        .child(svg(`mods/company-agents/chevron-${open ? "down" : "right"}.svg`).size(11).flex_none())
         .when(!open, (el) => el.child(String(subs.length)));
     };
 
@@ -1229,6 +1661,7 @@ export default class Agents extends View {
         effort: (isClaude ? labels["claude.effort"] || labels["agent.effort"] : labels["agent.effort"]) || null,
       }]];
     }));
+    const activityOf = activityAll(all);
     for (const [addr, c] of this.ctxRead) {
       const prev = contextOf.get(addr);
       contextOf.set(addr, {
@@ -1264,7 +1697,6 @@ export default class Agents extends View {
         .id(`pin-${a.address}`)
         .flex_none()
         .p(2)
-        .rounded(4)
         .text_color(t.dim)
         .cursor_pointer()
         .hover((s) => s.bg(t.hover).text_color(t.foreground))
@@ -1276,11 +1708,11 @@ export default class Agents extends View {
           this.hovered = null;
           cx.notify();
         })
-        .child(svg(`mods/workspace-chrome/${isPinned ? "pin-off" : "pin"}.svg`).size(13));
+        .child(svg(`mods/company-agents/${isPinned ? "pin-off" : "pin"}.svg`).size(13));
       // Under a space header the space goes without saying; an automatic tab number says nothing.
       // Without a space header above (priority, pinned) the row names its space.
       const full = byPriority || isPinned;
-      const name = full ? a.space_name || label(a) : more ?? (/^\d+$/.test(label(a)) ? a.program?.name || label(a) : label(a));
+      const name = (shared("pixel-hq.names") ?? {})[a.pane]?.name ?? (full ? a.space_name || label(a) : more ?? (/^\d+$/.test(label(a)) ? a.program?.name || label(a) : label(a)));
       return h_flex()
         .id(`ag-${a.address}`)
         .pl(4)
@@ -1289,7 +1721,6 @@ export default class Agents extends View {
         .flex_none()
         .border_b(2)
         .border_color("#5B8C3A66")
-        .rounded(8)
         .items_center()
         .gap(6)
         .bg("#10121ccc")
@@ -1355,7 +1786,7 @@ export default class Agents extends View {
         .child(div().flex_1())
         .when(!open, (el) => el
           .when(!byPriority && top && top !== "idle", (el) => el.child(this.status(t, { status: top }, true)))
-          .child(svg("mods/workspace-chrome/chevron-right.svg").size(11).flex_none().text_color(t.dim)));
+          .child(svg("mods/company-agents/chevron-right.svg").size(11).flex_none().text_color(t.dim)));
     };
     const rows = collapsed
       ? list.flatMap(withKids)
@@ -1394,7 +1825,7 @@ export default class Agents extends View {
       } else localStorage.setItem("petpos", JSON.stringify(this.petpos));
       cx.notify();
     };
-    const ROLES = (a) => (agentOf(a.program?.key, tabNameOf(a))?.role ?? "").toLowerCase();
+    const ROLES = (a) => ((shared("pixel-hq.names") ?? {})[a.pane]?.role ?? agentOf(a.program?.key, tabNameOf(a))?.role ?? "").toLowerCase();
     const STATE = { working: "typing working busy", idle: "idle break coffee snooze urge sleeping", done: "shipped done finished", blocked: "needs you blocked waiting" };
     const q = this.query.trim().toLowerCase();
     const hitOf = (a) => !q || q.split(/\s+/).every((w) => [detail.get(a.address), a.space_name, label(a), a.program?.name, ROLES(a), STATE[a.status]].join(" ").toLowerCase().includes(w));
@@ -1418,14 +1849,18 @@ export default class Agents extends View {
       const sy = rowsUsed > 1 ? (Math.floor(slot / colsUsed) + ((slot % colsUsed) % 2) * (rowsUsed < 3 ? 0.12 : 0)) / (rowsUsed - 1 + (rowsUsed < 3 ? 0.12 : 0)) : 0;
       const lap = 0;
       const own = this.petpos[a.address];
-      const left = own ? own[0] * sz.width : Math.max(2, Math.min(sz.width - petW - 2, sz.width * Math.min(0.92, sx + lap) - petW / 2));
+      // Room for the cubicle panels (9 units each side) and the server rack (11 units right), so an edge desk shows them.
+      const left = own ? own[0] * sz.width : Math.max(kk(10), Math.min(sz.width - petW - kk(12), sz.width * Math.min(0.92, sx + lap) - petW / 2));
       const top = own ? own[1] * sz.height : fieldTop + fieldH * Math.min(1, sy + lap);
       posOf.set(a.address, { x: left + petW / 2, y: top + PET * 0.5 });
       const ctx = contextOf.get(a.address);
       const ctxPct = ctx?.pct ?? null;
+      const act = activityOf.get(a.address) ?? { interns: [], jobs: 0, long: 0 };
+      // Typing speeds up with every intern and job at the desk, up to twice as fast.
+      const pace = 1 + Math.min(1, 0.25 * (act.interns.length + act.jobs));
       const modelTxt = ctx ? modelOf(ctx) : "";
       const more = detail.get(a.address);
-      const text = more ?? a.space_name ?? label(a);
+      const text = (shared("pixel-hq.names") ?? {})[a.pane]?.name ?? more ?? a.space_name ?? label(a);
       // The desk's branch (its own worktree, ideally) and whether another desk is about to step on it.
       const branch = paneBy.get(a.pane)?.branch ?? null;
       const [ticket, ...otherTickets] = this.ticketsOf(a);
@@ -1479,7 +1914,7 @@ export default class Agents extends View {
           .left(away ? dx : 0).top(away ? dy : 0)
           // Glide out and back, but not while it is being dragged, so it follows the pointer exactly.
           .when(this.drag?.addr !== a.address, (el) => el.transition("left", 800).transition("top", 800))
-          .child(figureFor(a.space_name, isNudged ? "done" : a.status, PET, unseen, speciesOf(progOf(a), tabNameOf(a)))))
+          .child(figureFor(a.space_name, isNudged ? "done" : a.status, PET, unseen, speciesOf(progOf(a), tabNameOf(a)), pace)))
         // Shipped: pixel confetti rains over the desk until someone looks at it.
         .when(a.status === "done", (el) => el.children([["#f9e2af", 0.10, 900], ["#f38ba8", 0.22, 1300], ["#a6e3a1", 0.34, 1000], ["#89b4fa", 0.46, 1500], ["#cba6f7", 0.58, 1100], ["#fab387", 0.70, 1400], ["#94e2d5", 0.82, 950]]
           .map(([c, fx0, p], j) => div().absolute().left(petW * fx0).top(-20).w(4).h(4).bg(c).loop("top", { from: -22 - (j % 3) * 6, to: PET * 0.55, period: p, easing: "linear" }))))
@@ -1490,6 +1925,49 @@ export default class Agents extends View {
         .child(div().absolute().left(-kk(3)).top(PET * 0.84 + kk(12)).w(petW + kk(6)).h(kk(10)).bg("#3b3f5a"))
         .child(div().absolute().left(ctr - kk(8)).top(PET * 0.84 + kk(15)).w(kk(16)).h(kk(3)).bg("#262a40"))
         .child(div().absolute().left(petW - kk(6)).top(PET * 0.84 - kk(4)).w(kk(7)).h(kk(4)).rounded(2).bg("#c9cee6"))
+        // A server rack on the right cubicle panel: one blinking LED per shell job, amber once it has run over a minute.
+        .when(act.jobs > 0, (el) => {
+          const rackTop = PET * 0.3, rackH = PET * 0.66, fit = Math.max(1, Math.floor((rackH - kk(4)) / kk(5)));
+          const leds = Array.from({ length: Math.min(act.jobs, fit) }, (_, i) => div().absolute().left(kk(2)).top(kk(3) + i * kk(5)).w(kk(5)).h(Math.max(2, kk(3))).rounded(1)
+            .bg(i < act.long ? "#f9b84a" : "#a6e3a1").loop("opacity", { from: 0.3, to: 1, period: 360 + ((i * 137) % 420), easing: "linear" }));
+          return el.child(div().absolute().left(petW + kk(2)).top(rackTop).w(kk(9)).h(rackH).rounded(2).bg("#161827").border_1().border_color("#2e3250")
+            .child(div().absolute().left(kk(2)).top(rackH - kk(4)).w(kk(5)).h(kk(1)).bg("#2e3250"))
+            .children(leds));
+        })
+        // Runners: a little helper bot per running shell job (three at most, then "+N"), pacing the floor between the desk and
+        // the rack with a parcel, hopping as it goes; amber once its job has run over a minute. All motion is native loops.
+        .when(act.jobs > 0, (el) => {
+          // Sized like an intern (13 units tall), on the floor below the desk, clear of the interns at its front.
+          const u = Math.max(1.4, (PET * 0.4) / 13), ru = (v) => Math.round(v * u);
+          const rh = ru(13), floor = PET * 0.84 + kk(22) - rh + kk(13), shown = Math.min(act.jobs, 3), extra = act.jobs - shown;
+          const x0 = ctr - ru(4), x1 = petW + kk(4);
+          const bot = (i) => {
+            const c = i < act.long ? "#f9b84a" : "#a6e3a1", leg = 150 + i * 30;
+            // Paced by an offset from x0, not absolute positions: Herdr doesn't scale loop values by the zoom.
+            return div().absolute().left(x0).top(floor + (i % 2) * ru(2)).w(x1 - x0 + ru(9)).h(rh)
+              .child(div().absolute().top(0).left(0).w(ru(9)).h(rh).loop("left", { from: i % 2 ? x1 - x0 : 0, to: i % 2 ? 0 : x1 - x0, period: 1700 + i * 600, easing: "ease-in-out" })
+              .child(div().absolute().left(0).top(0).w(ru(9)).h(rh).loop("top", { from: 0, to: -ru(2), period: 320 + i * 40, easing: "ease-out" })
+                .child(div().absolute().left(ru(1)).top(0).w(ru(7)).h(ru(6)).rounded(2).bg(c))
+                .child(div().absolute().left(ru(2)).top(ru(2)).w(ru(5)).h(ru(2)).bg("#1e2030")
+                  .child(div().absolute().left(ru(1)).top(0).w(ru(1)).h(ru(2)).bg(c).loop("left", { from: 0, to: ru(3), period: 900, easing: "linear" })))
+                .child(div().absolute().left(ru(2)).top(ru(6)).w(ru(5)).h(ru(4)).bg("#585e82"))
+                .child(div().absolute().left(ru(4)).top(ru(5)).w(ru(5)).h(ru(4)).rounded(1).bg("#e9d8b4").border_1().border_color("#a8946a"))
+                .child(div().absolute().left(ru(2)).top(ru(10)).w(ru(2)).bg("#2b2f45").loop("height", { from: ru(1), to: ru(3), period: leg, easing: "linear" }))
+                .child(div().absolute().left(ru(5)).top(ru(10)).w(ru(2)).bg("#2b2f45").loop("height", { from: ru(3), to: ru(1), period: leg, easing: "linear" }))));
+          };
+          return el.children(Array.from({ length: shown }, (_, i) => bot(i)))
+            .when(extra > 0, (e2) => e2.child(div().absolute().left(x1 + ru(4)).top(floor + ru(3)).px(2).rounded(3)
+              .bg("#0f111acc").text_size(Math.max(8, kk(9))).text_color("#cdd6f4").child(`+${extra}`)));
+        })
+        // Interns in front of the desk, one tiny pet per running sub-agent (three at most, then "+N").
+        .when(act.interns.length > 0, (el) => {
+          const ih = Math.max(12, Math.round(PET * 0.38)), iw = duckWidth(ih), step = Math.round(iw * 0.62);
+          const top = PET * 0.84 + kk(22) - ih, shown = act.interns.slice(0, 3), extra = act.interns.length - shown.length;
+          return el
+            .children(shown.map((it, j) => div().absolute().left(kk(2) + j * step).top(top).child(duckMood(mood(it.status, 0), ih, { species: it.species }))))
+            .when(extra > 0, (e2) => e2.child(div().absolute().left(kk(2) + shown.length * step + Math.round(iw * 0.45)).top(top + Math.round(ih * 0.3)).px(3).rounded(3)
+              .bg("#0f111acc").text_size(Math.max(8, kk(9))).text_color("#cdd6f4").child(`+${extra}`)));
+        })
         // Papers pile up on the desk as the agent's context fills: one sheet per 10%, the top ones turn pink past 80%.
         .when(Boolean(ctxPct != null && ctxPct >= 5), (el) => {
           const n = Math.max(1, Math.min(10, Math.ceil(ctxPct / 10)));
@@ -1501,9 +1979,11 @@ export default class Agents extends View {
             .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
             .on_click((_e, cx) => { cx.stop_propagation(); this.pileClick(a, cx); })
             .children(sheets);
-          return el.child(full ? pile.loop("top", { from: PET * 0.84 - n * sh - kk(4), to: PET * 0.84 - n * sh - kk(6), period: 600, easing: "ease-in-out" }) : pile);
+          // A full pile bobs by a small offset inside a normally placed box (loop values aren't scaled by the zoom).
+          return el.child(full ? div().absolute().left(0).top(PET * 0.84 - n * sh - kk(6)).w(petW).h(n * sh + kk(8))
+            .child(pile.top(kk(2)).loop("top", { from: kk(2), to: 0, period: 600, easing: "ease-in-out" })) : pile);
         })
-        .when(a.status === "done", (el) => el.child(div().id(`settle-${a.address}`).absolute().left(-kk(3)).top(-kk(13)).w(kk(13)).h(kk(13)).rounded(3)
+        .when(a.status === "done", (el) => el.child(div().id(`settle-${a.address}`).absolute().left(-kk(3)).top(-kk(13)).w(kk(13)).h(kk(13))
           .bg("#a6e3a1").flex().items_center().justify_center().cursor_pointer()
           .tooltip("Settle: this staff clocks out until their next task")
           .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
@@ -1529,9 +2009,9 @@ export default class Agents extends View {
         })
         .on_mouse_up("left", (_e, cx) => endDrag(cx))
         .on_mouse_down("right", (_e, cx) => { cx.stop_propagation(); openFigures(a.space_name); })
-        .tooltip(`${a.program?.name ?? ""} · ${isUrge ? `idle for ${duration(waited)} · click to focus` : isSnooze ? `snoozing (${duration(waited)}) · click to focus` : a.status} · ${text}${branch ? ` · ${branch}` : ""}${clTip ? ` · ${clTip}` : ""}${ctx ? ` · ${vitalsTip(ctx)}` : ""} · drag to move`)
+        .tooltip(`${a.program?.name ?? ""} · ${isUrge ? `idle for ${duration(waited)} · click to focus` : isSnooze ? `snoozing (${duration(waited)}) · click to focus` : a.status} · ${text}${branch ? ` · ${branch}` : ""}${clTip ? ` · ${clTip}` : ""}${ctx ? ` · ${vitalsTip(ctx)}` : ""}${act.interns.length ? ` · ${act.interns.length} sub-agent${act.interns.length > 1 ? "s" : ""}` : ""}${act.jobs ? ` · ${act.jobs} shell job${act.jobs > 1 ? "s" : ""}${act.long ? ` (${act.long} over a minute)` : ""}` : ""} · drag to move`)
         .child(seat)
-        .child(div().mt(6).max_w(Math.max(petW + 22, cellW - 4)).px(5).h(15).flex().items_center().rounded(3)
+        .child(div().mt(6).max_w(Math.max(petW + 22, cellW - 4)).px(5).h(15).flex().items_center()
           .bg(this.hint?.addr === a.address ? "#cba6f7" : cl ? (cl.kind === "file" ? "#ff5370" : "#f9b84a") : a.focused || (q && hitOf(a)) ? "#f9e2af" : hot ? "#f38ba8" : isUrge ? "#fab387" : isSnooze ? "#45475a" : "#0f111acc")
           .text_size(10.5).text_color(this.hint?.addr === a.address ? "#1e1233" : cl ? "#2a0f16" : a.focused || (q && hitOf(a)) ? "#2a1a14" : isUrge ? "#1e1e2e" : isSnooze ? "#cdd6f4" : "#ffffff").truncate()
           .child(this.hint?.addr === a.address ? this.hint.text : cl ? clText : `${text}${when && cellW >= 90 ? (isUrge ? ` · idle ${duration(waited)} ⏰` : isSnooze ? ` · zzz ${duration(waited)}` : ` · ${duration(waited)}`) : ""}`))
@@ -1556,23 +2036,54 @@ export default class Agents extends View {
           .loop("opacity", { from: 0.1, to: 1, period: 700 + (k % 4) * 140, easing: "ease-in-out" }));
       }
     }
+    // The wall shows the whole company: the time of day, a building per space, who needs you, the office's load, work shipped today.
+    const todayNow = this.today?.day === dayKey() ? this.today : freshDay();
+    const officeLoad = everyone.reduce((n, a) => { const x = activityOf.get(a.address); return n + (x ? x.interns.length + x.jobs : 0); }, 0);
+    const sceneOpts = {
+      music: Boolean(shared("pixel-hq.music")?.playing),
+      now: new Date(),
+      spaces: spaces().map((sp) => ({ id: sp.id, name: sp.name, status: sp.status, active: sp.active })),
+      needYou: blockedAll.length,
+      load: officeLoad,
+      shipped: todayNow.shipped,
+      droop: blockedAll.some((a) => this.waitOf(a.address, a.status, now) >= 300000),
+      board: {
+        events: this.events ?? [],
+        workMs: todayNow.workMs,
+        blocked: blockedAll.map((a) => String(a.space_name || a.program?.name || "").toUpperCase()),
+        // Fuel: the lowest usage window left across agents that report one (Claude Code's 5-hour window, Antigravity, Codex).
+        fuel: all.flatMap((k) => {
+          const q = contextOf.get(k.address)?.quota;
+          if (q == null || k.state !== "live") return [];
+          const fam = progOf(k).toLowerCase(), reset = Number(k.labels?.["claude.quota_reset"]);
+          return [{ q, who: /claude/.test(fam) ? "CLAUDE" : /codex/.test(fam) ? "CODEX" : /agy|antigravity/.test(fam) ? "AGY" : fam.toUpperCase(), reset: reset > 0 ? reset * 1000 : null }];
+        }).sort((x, y) => x.q - y.q),
+        hot: everyone.flatMap((a) => { const p = contextOf.get(a.address)?.pct; return p != null && p >= 80 ? [{ who: String(a.space_name || a.program?.name || "").toUpperCase(), p, addr: a.address }] : []; })
+          .sort((x, y) => y.p - x.p),
+      },
+    };
     const farm = div().id("farm-area").relative().flex_1().min_h(0).overflow_hidden()
       .on_mouse_move((e, cx) => {
         const d = this.drag;
         if (!d) return;
         if (!d.moved && Math.hypot(e.position.x - d.sx, e.position.y - d.sy) < 4) return;
         d.moved = true;
-        const x = Math.max(0, Math.min(sz.width - petW, e.local_position.x - d.dx));
-        const y = Math.max(0, Math.min(sz.height - PET - 34, e.local_position.y - d.dy));
+        const z = Number(settings()?.zoom) > 0 ? Number(settings().zoom) : 1;
+        const x = Math.max(0, Math.min(sz.width - petW, (e.local_position.x - d.dx) / z));
+        const y = Math.max(0, Math.min(sz.height - PET - 34, (e.local_position.y - d.dy) / z));
         this.petpos[d.addr] = [x / sz.width, y / sz.height];
         cx.notify();
       })
       .on_mouse_up("left", (_e, cx) => endDrag(cx))
       .on_mouse_down("right", () => { this.petpos = {}; localStorage.removeItem("petpos"); })
+      // Sizes arrive in window pixels, but everything drawn here is in the mod's own units, which Herdr scales by the zoom: divide
+      // it out, or at zoom 1.2 the wall is drawn 20% too wide and its right corner (rack and monitor desk) falls off the edge.
       .on_size_change((s, cx) => {
-        if (!this.size || Math.abs(s.width - this.size.width) > 2 || Math.abs(s.height - this.size.height) > 2) { this.size = s; cx.notify(); }
+        const z = Number(settings()?.zoom) > 0 ? Number(settings().zoom) : 1, w = s.width / z, h = s.height / z;
+        if (!this.size || Math.abs(w - this.size.width) > 2 || Math.abs(h - this.size.height) > 2) { this.size = { width: w, height: h }; cx.notify(); }
       })
-      .child(scene(sz.width, sz.height, Boolean(shared("pixel-hq.music")?.playing)))
+      .child(scene(sz.width, sz.height, sceneOpts))
+      .children(this.sceneSpots(sz, everyone, sceneOpts))
       .when(Math.max(64, Math.min(110, Math.round(sz.width * 0.27 / 4) * 4)) >= 64, (el) => {
         const m = shared("pixel-hq.music");
         const isPlaying = Boolean(m?.playing);
@@ -1600,17 +2111,17 @@ export default class Agents extends View {
             })
         );
       })
-      .when(list.length === 0 && settledFloor === 0, (el) => el.child(div().absolute().left(12).top(sz.height * 0.5).w(sz.width - 24).px(8).py(6).rounded(3).bg("#0f111acc").text_size(12).text_color("#ffffff").child("No staff on this floor yet. Hire one with the + above, or start an agent in this space.")))
-      .when(list.length === 0 && settledFloor > 0, (el) => el.child(div().absolute().left(12).top(sz.height * 0.5).w(sz.width - 24).px(8).py(6).rounded(3).bg("#0f111acc").text_size(12).text_color("#a6e3a1").child("Everyone shipped has clocked out. Click the ✓ settled chip in the corner to bring them back.")))
-      .when(hidden > 0, (el) => el.child(div().absolute().right(8).top(horizon + 6).px(8).py(3).rounded(8).bg("#11111bdd").border_1().border_color("#45475a").text_size(11).text_color("#cdd6f4").child(`+${hidden} more · narrow the panel to list all`)))
+      .when(list.length === 0 && settledFloor === 0, (el) => el.child(div().absolute().left(12).top(sz.height * 0.5).w(sz.width - 24).px(8).py(6).bg("#0f111acc").border_1().border_color("#313244").text_size(12).text_color("#ffffff").child("No staff on this floor yet. Hire one with the + above, or start an agent in this space.")))
+      .when(list.length === 0 && settledFloor > 0, (el) => el.child(div().absolute().left(12).top(sz.height * 0.5).w(sz.width - 24).px(8).py(6).bg("#0f111acc").border_1().border_color("#313244").text_size(12).text_color("#a6e3a1").child("Everyone shipped has clocked out. Click the ✓ settled chip in the corner to bring them back.")))
+      .when(hidden > 0, (el) => el.child(div().absolute().right(8).top(horizon + 6).px(8).py(3).bg("#11111bdd").border_1().border_color("#45475a").text_size(11).text_color("#cdd6f4").child(`+${hidden} more · narrow the panel to list all`)))
       .children(links)
       .children(this.drag?.moved ? [...pets.filter((_, i) => seated[i].address !== this.drag.addr), ...pets.filter((_, i) => seated[i].address === this.drag.addr)] : pets)
       .when(Boolean(this.notice), (el) => {
-        const box = v_flex().id("oc-notice").absolute().left(8).right(8).top(horizon + 6).px(8).py(6).gap(6).rounded(8).bg("#11111bee").border_1().border_color("#89b4fa").text_size(11).text_color("#cdd6f4")
+        const box = v_flex().id("oc-notice").absolute().left(8).right(8).top(horizon + 6).px(8).py(6).gap(6).bg("#11111bee").border_1().border_color("#89b4fa").text_size(11).text_color("#cdd6f4")
           .on_mouse_down("left", (_e, cx) => cx.stop_propagation());
         return el.child(box.cursor_pointer().on_click((_e, cx) => { this.notice = null; cx.notify(); }).child(this.notice));
       })
-      .when(settledCount > 0, (el) => el.child(div().id("settled-undo").absolute().right(8).top(this.notice ? horizon + 84 : horizon + 6).px(8).py(3).rounded(8).bg("#11111bdd").border_1().border_color("#45475a").text_size(11).text_color("#a6e3a1").cursor_pointer()
+      .when(settledCount > 0, (el) => el.child(div().id("settled-undo").absolute().right(8).top(this.notice ? horizon + 84 : horizon + 6).px(8).py(3).bg("#11111bdd").border_1().border_color("#45475a").text_size(11).text_color("#a6e3a1").cursor_pointer()
         .tooltip("Bring settled staff back on every floor")
         .on_click((_e, cx) => { this.settled.clear(); try { localStorage.removeItem("settled"); } catch { /* storage disabled: next render retries */ } cx.notify(); })
         .child(`✓ ${settledCount} settled`)));
@@ -1623,7 +2134,7 @@ export default class Agents extends View {
     ];
     const MAG = [[2, 0, 4, 1], [1, 1, 1, 1], [6, 1, 1, 1], [0, 2, 1, 4], [7, 2, 1, 4], [1, 6, 1, 1], [6, 6, 1, 1], [2, 7, 4, 1], [7, 7, 2, 1], [8, 8, 2, 1], [9, 9, 1, 1]];
     const magnifier = (c) => div().relative().w(15).h(15).flex_none().children(MAG.map(([x, y, w, h]) => div().absolute().left(x * 1.5).top(y * 1.5).w(w * 1.5).h(h * 1.5).bg(c)));
-        const corgi = image("mods/company-brand/logo.png").size(24).flex_none().rounded(4);
+    const corgi = image("mods/company-brand/logo.png").size(24).flex_none();
     const mono = "JetBrains Mono";
 
     return v_flex()
@@ -1646,13 +2157,13 @@ export default class Agents extends View {
                   .tooltip(`${blockedAll.length} ${blockedAll.length === 1 ? "agent needs" : "agents need"} you · open the list`)
                   .on_click(() => this.openNeedsYou())
                   .children([[6, 0, 2, 1], [4, 1, 6, 1], [3, 2, 8, 1], [2, 3, 10, 7], [1, 10, 12, 2], [0, 12, 14, 1], [5, 13, 4, 1], [6, 14, 2, 1]].map(([x, y, w, h]) => div().absolute().left(x).top(y).w(w).h(h).bg("#f9e2af")))
-                  .child(div().absolute().right(-5).top(-5).min_w(10).h(10).px(2).rounded(5).bg("#f38ba8").flex().items_center().justify_center().text_size(7.5).font_bold().text_color("#11111b").child(String(blockedAll.length)))))
+                  .child(div().absolute().right(-5).top(-5).min_w(10).h(10).px(2).border_1().border_color("#11111b").bg("#f38ba8").flex().items_center().justify_center().text_size(7.5).font_bold().text_color("#11111b").child(String(blockedAll.length)))))
                 .when(Boolean(this.fileError), (el) => el.child(div().id("ag-file-error").text_size(11).font_bold().text_color(t.blocked)
                   .tooltip(`${this.fileError}. Using the last good figures.`).child("!")))
                 .child(div().id("ag-hire").relative().w(14).h(14).flex_none().cursor_pointer()
                   .tooltip("Hire staff: a new agent in its own git worktree")
                   .on_click((_e, cx) => this.openHire(cx))
-                  .children([[6, 0, 2, 14], [0, 6, 14, 2]].map(([x, y, w, h]) => div().absolute().left(x).top(y).w(w).h(h).bg(this.hiring.open ? "#f9e2af" : "#89b4fa"))))
+                  .children([[5, 1, 4, 12], [1, 5, 12, 4]].map(([x, y, w, h]) => div().absolute().left(x).top(y).w(w).h(h).bg(this.hiring.open ? "#f9e2af" : "#89b4fa"))))
                 .child(div()
                   .id("ag-figures")
                   .text_color(t.dim)
@@ -1666,9 +2177,9 @@ export default class Agents extends View {
                     .text_size(11)
                     .text_color(t.dim)
                     .hover((s) => s.text_color(t.foreground))
-                    .on_click(() => openOverlay({ mod: "company-agents", kind: "popup", width: 200, height: 140, props: { sortMenu: true } }))
+                    .on_click(() => openOverlay({ mod: "company-agents", kind: "popup", frame: "none", width: 200, height: 140, props: { sortMenu: true } }))
                     .tooltip(`Sort agents: ${sort.label}`)
-                    .child(svg(`mods/workspace-chrome/${sort.icon}.svg`).size(14)),
+                    .child(svg(`mods/company-agents/${sort.icon}.svg`).size(14)),
                 ))),
         )),
       )
@@ -1682,7 +2193,7 @@ export default class Agents extends View {
             .child(div().font_family(mono).font_bold().text_size(10).text_color("#89b4fa").child("HIRE STAFF · NEW WORKTREE"))
             .child(box(this.ticketInput))
             .child(box(this.repoInput))
-            .child(h_flex().gap(4).children(["claude", "codex", "opencode", "agy"].map((pg) => div().id(`hire-${pg}`).px(8).h(22).flex().items_center().cursor_pointer().border_1()
+            .child(h_flex().gap(4).flex_wrap().children(["claude", "codex", "opencode", "agy", "hermes"].map((pg) => div().id(`hire-${pg}`).px(8).h(22).flex().items_center().cursor_pointer().border_1()
               .border_color(h.program === pg ? "#89b4fa" : "#45475a").bg(h.program === pg ? "#89b4fa22" : "#181825").text_size(10.5).font_family(mono).text_color(h.program === pg ? "#89b4fa" : "#a6adc8")
               .on_click((_e, cx) => { h.program = pg; cx.notify(); }).child(pg))))
             .when(Boolean(h.error), (e2) => e2.child(div().text_size(10.5).text_color("#ff5370").child(h.error)))
@@ -1701,7 +2212,7 @@ export default class Agents extends View {
             .child(div().id("staff-clear").flex_none().px(4).text_size(14).font_family(mono).text_color(t.dim).cursor_pointer().hover((s) => s.text_color(t.foreground))
               .on_click((_e, cx) => { this.searchInput.set_value(""); this.query = ""; cx.notify(); }).child("×"))))))
       .child(collapsed ? v_flex().id("ag-list").flex_1().min_h(0).px(0).overflow_y_scrollbar().mode("always").children(rows) : farm)
-      .when(collapsed && settledCount > 0, (el) => el.child(h_flex().h(22).px(6).items_center().child(div().id("settled-undo-rail").px(6).h(17).flex().items_center().rounded(8).bg("#a6e3a122").text_size(10).text_color("#a6e3a1").cursor_pointer()
+      .when(collapsed && settledCount > 0, (el) => el.child(h_flex().h(22).px(6).items_center().child(div().id("settled-undo-rail").px(6).h(17).flex().items_center().border_1().border_color("#a6e3a155").bg("#a6e3a122").text_size(10).text_color("#a6e3a1").cursor_pointer()
         .tooltip("Bring settled staff back on every floor")
         .on_click((_e, cx) => { this.settled.clear(); try { localStorage.removeItem("settled"); } catch { /* storage disabled: next render retries */ } cx.notify(); })
         .child(`✓ ${settledCount} settled`))))

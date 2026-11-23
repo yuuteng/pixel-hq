@@ -19,7 +19,7 @@ function ellipse(cx, cy, rx, ry, c) {
 // The tech corner on the wall: a server rack (drive bays, vents and fans, a glowing light on every unit) and a modern little desk with a monitor, keyboard and a mug.
 const LIGHTS = ["#f4723a", "#f9d23c", "#8fcb4f", "#37c5d6", "#c678dd", "#f38ba8"];
 const CODE = ["#cba6f7", "#89b4fa", "#a6e3a1", "#f9e2af", "#f5c2e7", "#94e2d5"]; // keyword, function, string, class, tag, type
-function ledWall(x, w, base, isMusicPlaying = false) {
+function ledWall(x, w, base, isMusicPlaying = false, load = 0) {
   const o = [], top = 8, rw = w >= 64 ? snap(Math.min(28, w * 0.34)) : snap(w), rh = snap(Math.min(base - top, 80)), rt = base - rh;
   // Server rack: a cabinet with a lit top cap, a darker side, a plinth with feet, and units of three kinds.
   o.push(r(x - 2, rt - 2, rw + 4, rh + 2, "#0a0c1a"), r(x, rt, rw, rh, "#1a1f3d"), r(x + rw - 3, rt, 3, rh, "#12152c"), r(x, rt, 1, rh, "#2c3366"),
@@ -38,8 +38,10 @@ function ledWall(x, w, base, isMusicPlaying = false) {
     }
     else for (let f = 0; f < (uw >= 28 ? 2 : 1); f++) o.push(r(ux + 8 + f * 8, uy + 2, 5, 5, "#10132a"), r(ux + 9 + f * 8, uy + 3, 3, 3, "#323a70"));
     o.push(r(ux + 1, uy + 2, 5, 5, ledC + "33"));
-    const led = r(ux + 2, uy + 3, 3, 3, ledC);
-    o.push(k % 3 === 1 ? led.loop("opacity", { from: 0.25, to: 1, period: 700 + k * 230, easing: "ease-in-out" }) : led);
+    // One busy unit per sub-agent or shell job in the office: a green light blinking fast.
+    const busy = k < load, led = r(ux + 2, uy + 3, 3, 3, busy ? "#a6e3a1" : ledC);
+    o.push(busy ? led.loop("opacity", { from: 0.15, to: 1, period: 220 + ((k * 97) % 240), easing: "linear" })
+      : k % 3 === 1 ? led.loop("opacity", { from: 0.25, to: 1, period: 700 + k * 230, easing: "ease-in-out" }) : led);
   }
   if (w >= 64) {
     const rx = x + 3, ry = rt - 11;
@@ -128,63 +130,178 @@ function ledWall(x, w, base, isMusicPlaying = false) {
 
 export const yHorizon = (H) => snap(snap(H) * 0.3); // where the wall ends and the floor begins
 
-export function scene(W, H, isMusicPlaying = false) {
+// The time of day from the local clock: the sky, the city, the sun or the moon and the light on the floor follow it.
+const PHASES = {
+  night: { sky: "#0e1226", city: "#161b36", pool: "#ffffff07", stars: true, body: "#d9cf9a" },
+  dawn: { sky: "#3d2f5e", city: "#1f2342", pool: "#ffd9a00b", stars: false, body: "#fab387" },
+  day: { sky: "#4f86c6", city: "#2d3d6b", pool: "#ffffff12", stars: false, body: "#f9e2af" },
+  dusk: { sky: "#5a3358", city: "#22213f", pool: "#ffb38a0b", stars: false, body: "#fab387" },
+};
+export function phaseOf(date) {
+  const h = date.getHours() + date.getMinutes() / 60;
+  const name = h >= 5 && h < 7.5 ? "dawn" : h >= 7.5 && h < 17.5 ? "day" : h >= 17.5 && h < 20.5 ? "dusk" : "night";
+  // How far the sun (5:00 to 20:30) or the moon (20:30 to 5:00) has crossed the sky, 0 to 1.
+  const progress = name === "night" ? (((h - 20.5) + 24) % 24) / 8.5 : (h - 5) / 15.5;
+  return { name, h, progress: Math.max(0, Math.min(1, progress)) };
+}
+
+// Where everything on the wall is, shared by the drawing and by the clickable spots over it (main.js).
+export function sceneLayout(W, H) {
   W = snap(W); H = snap(H);
-  const yH = yHorizon(H);
-  const base = yH - 8; // the top of the baseboard: things stand on it
+  const yH = yHorizon(H), base = yH - 8;
+  const rackW = Math.max(64, Math.min(110, snap(W * 0.27))), rackX = W - rackW - 10;
+  const rackCab = rackW >= 64 ? snap(Math.min(28, rackW * 0.34)) : snap(rackW), rackTop = base - snap(Math.min(base - 8, 80));
+  const cw = rackX - 30, x0 = 38, usable = cw - 10 - x0;
+  const two = usable >= 100;
+  const gap = two ? Math.max(32, snap(usable * 0.26)) : 0;
+  const wA = two ? snap((usable - gap) / 2) : usable, wB = usable - wA - gap;
+  const winY = snap(yH * 0.1), winH = snap(yH * 0.58);
+  const wins = [{ x: x0, w: snap(wA), seed: 1, moon: true }, ...(two ? [{ x: x0 + wA + gap, w: snap(wB), seed: 4, moon: false }] : [])].map((o) => ({ ...o, y: winY, h: winH }));
+  const buildings = wins.flatMap((wn) => {
+    const bw = snap(wn.w / 6);
+    return Array.from({ length: 6 }, (_, i) => {
+      const bh = snap(14 + rnd(i + wn.seed * 7) * wn.h * 0.5);
+      return { x: wn.x + i * bw, y: wn.y + wn.h - bh, w: bw - 2, h: bh, i, seed: wn.seed };
+    });
+  });
+  const cx = two ? x0 + wA + Math.floor(gap / 2) : snap(W * 0.5), cr = Math.min(14, Math.floor(gap / 2) - 2) || 14;
+  const rr = Math.max(8, cr);
+  const sign = gap >= 44 && base - 48 >= 88 ? { x: cx - 16, y: 48, w: 32, h: 32 } : null;
+  // The board: a dot-matrix strip on the wall under the windows, between the plant and the water cooler, when there is room.
+  const sill = winY + winH + 4, bx = x0 - 2, bw = cw - 8 - bx, bh = 16;
+  const board = base - sill >= 30 && bw >= 96 ? { x: bx, y: snap(sill + Math.max(6, (base - sill - bh) / 2 - 4)), w: bw, h: bh } : null;
+  return { W, H, yH, base, rackX, rackW, rackCab, rackTop, cw, wins, buildings, two, cx, cy: 26, rr, sign, board,
+    cooler: { x: cw, y: base - 54, w: 20, h: 54 }, plant: { x: 0, y: base - 84, w: 36, h: 84 } };
+}
+
+// opts: { music, now (Date), spaces: [{ id, name, status, active }], needYou, load, shipped, droop }.
+// A boolean is the old signature (music playing).
+export function scene(W, H, opts = {}) {
+  if (typeof opts === "boolean") opts = { music: opts };
+  const Lo = sceneLayout(W, H);
+  ({ W, H } = Lo);
+  const { yH, base, wins, buildings, cx, cy, rr } = Lo;
+  const now = opts.now ?? new Date();
+  const ph = phaseOf(now), P = PHASES[ph.name];
   const L = [];
 
   // Back wall: slate, a lighter band, a dark skirting and a dark line under the ceiling.
   L.push(r(0, 0, W, yH, "#262a42"), r(0, 0, W, 4, "#161827"), r(0, yH - 32, W, 24, "#2c3150"), r(0, yH - 32, W, 4, "#363c5f"), r(0, base, W, 8, "#171a2c"));
 
-  // Two windows onto a night city, in dark frames with a pale sill and a few glints on the glass.
-  const win = (x, seed, withMoon, ww = W * 0.25) => {
-    const w = snap(ww), h = snap(yH * 0.58), y = snap(yH * 0.1);
-    const o = [r(x - 4, y - 4, w + 8, h + 8, "#0c0e1c"), r(x, y, w, h, "#0e1226")];
-    for (let i = 0; i < 6; i++) o.push(r(x + 6 + (i % 4) * snap(w / 4), y + 6 + snap(rnd(i + seed) * h * 0.3), U, U, "#f5e9b0").loop("opacity", { from: 0.2, to: 0.9, period: 1500 + i * 400, easing: "ease-in-out" }));
-    if (withMoon) o.push(...ellipse(x + w - 16, y + 16, 8, 8, "#d9cf9a"));
-    const bw = snap(w / 6);
-    for (let i = 0; i < 6; i++) {
-      const bh = snap(14 + rnd(i + seed * 7) * h * 0.5), bx = x + i * bw;
-      o.push(r(bx, y + h - bh, bw - 2, bh, "#161b36"));
-      for (let k = 0; k < 3; k++) if (rnd(i * 5 + k + seed) > 0.35) o.push(r(bx + 4 + (k % 2) * 8, y + h - bh + 6 + Math.floor(k / 2) * 10, U, U, "#e0b94a").loop("opacity", { from: 0.5, to: 1, period: 2000 + k * 700, easing: "ease-in-out" }));
+  // Windows onto the city: the sky of the hour, stars at night, the sun or the moon crossing from the left window to the right.
+  for (const wn of wins) {
+    L.push(r(wn.x - 4, wn.y - 4, wn.w + 8, wn.h + 8, "#0c0e1c"), r(wn.x, wn.y, wn.w, wn.h, P.sky));
+    if (P.stars) for (let i = 0; i < 6; i++) L.push(r(wn.x + 6 + (i % 4) * snap(wn.w / 4), wn.y + 6 + snap(rnd(i + wn.seed) * wn.h * 0.3), U, U, "#f5e9b0").loop("opacity", { from: 0.2, to: 0.9, period: 1500 + i * 400, easing: "ease-in-out" }));
+  }
+  {
+    const span = wins.reduce((n, wn) => n + wn.w - 20, 0);
+    let along = ph.progress * span;
+    const wn = wins.find((w) => { if (along <= w.w - 20) return true; along -= w.w - 20; return false; }) ?? wins[wins.length - 1];
+    const bx = snap(wn.x + 10 + Math.min(along, wn.w - 20)), by = snap(wn.y + 12 + (1 - Math.sin(Math.PI * ph.progress)) * wn.h * 0.3);
+    L.push(...ellipse(bx, by, 8, 8, P.body));
+    if (ph.name === "day") L.push(...ellipse(bx, by, 12, 12, "#f9e2af22"));
+  }
+
+  // The city: one building per space (in the order of the spaces list, as many as there are buildings). A space with an agent at
+  // work is lit up, one that needs you blinks a red beacon on its roof, one that shipped shows a green one; the floor you are on
+  // has a blue roof line. The other buildings keep a few lights at night.
+  const spaceList = opts.spaces ?? [];
+  for (const b of buildings) {
+    const k = buildings.indexOf(b), sp = spaceList[k] ?? null, st = sp?.status ?? null;
+    L.push(r(b.x, b.y, b.w, b.h, P.city));
+    if (sp?.active) L.push(r(b.x, b.y, b.w, 2, "#89b4fa"));
+    const rows = Math.max(1, Math.min(4, Math.floor((b.h - 6) / 10)));
+    for (let q = 0; q < rows * 2; q++) {
+      const lx = b.x + 4 + (q % 2) * 8, ly = b.y + 6 + Math.floor(q / 2) * 10;
+      if (lx + U > b.x + b.w - 1) continue;
+      const seed = rnd(q + b.i * 13 + b.seed * 5);
+      const on = st === "working" ? seed > 0.2 : st === "blocked" ? seed > 0.5 : st ? q === 0 : P.stars ? seed > 0.65 : false;
+      if (!on) continue;
+      L.push(r(lx, ly, U, U, "#e0b94a").loop("opacity", { from: st === "working" ? 0.35 : 0.5, to: 1, period: st === "working" ? 700 + ((q * 137 + b.i * 61) % 600) : 2000 + q * 700, easing: "ease-in-out" }));
     }
-    for (const f of [0.16, 0.5, 0.84]) for (let s = 0; s < h / 4; s++) { const gx = x + f * w - s * 3; if (gx > x + 2 && gx + 8 < x + w - 2) o.push(r(gx, y + s * 4, 8, 4, "#ffffff0d")); }
-    o.push(r(x + w / 2 - 2, y, 4, h, "#0c0e1c"), r(x, y + h / 2 - 2, w, 4, "#0c0e1c"), r(x - 8, y + h + 4, w + 16, 5, "#7e86ad"));
+    if (st === "blocked") L.push(r(b.x + Math.floor(b.w / 2) - 2, b.y - 4, 4, 4, "#f38ba8").loop("opacity", { from: 0.15, to: 1, period: 480, easing: "linear" }));
+    else if (st === "done") L.push(r(b.x + Math.floor(b.w / 2) - 2, b.y - 4, 4, 4, "#a6e3a1"));
+  }
+  for (const wn of wins) {
+    for (const f of [0.16, 0.5, 0.84]) for (let s = 0; s < wn.h / 4; s++) { const gx = wn.x + f * wn.w - s * 3; if (gx > wn.x + 2 && gx + 8 < wn.x + wn.w - 2) L.push(r(gx, wn.y + s * 4, 8, 4, "#ffffff0d")); }
+    L.push(r(wn.x + wn.w / 2 - 2, wn.y, 4, wn.h, "#0c0e1c"), r(wn.x, wn.y + wn.h / 2 - 2, wn.w, 4, "#0c0e1c"), r(wn.x - 8, wn.y + wn.h + 4, wn.w + 16, 5, "#7e86ad"));
+  }
+
+  // The clock between the windows shows the time: an hour and a minute hand drawn in 2px steps.
+  const hand = (len, ang, c, t) => {
+    const o = [];
+    for (let st = 1; st <= len; st += 2) o.push(r(Math.round(cx + Math.sin(ang) * st - t / 2), Math.round(cy - Math.cos(ang) * st - t / 2), t, t, c));
     return o;
   };
-  // Left to right: a plant, two windows with the clock between them, the water cooler, then the server rack and wall monitor.
-  const rackW = Math.max(64, Math.min(110, snap(W * 0.27))), rackX = W - rackW - 10;
-  const cw = rackX - 30, x0 = 38, usable = cw - 10 - x0;
-  const two = usable >= 100;
-  const gap = two ? Math.max(32, snap(usable * 0.26)) : 0;
-  const wA = two ? snap((usable - gap) / 2) : usable, wB = usable - wA - gap;
-  const wx1 = x0, wx2 = x0 + wA + gap;
-  L.push(...win(wx1, 1, true, wA));
-  if (two) L.push(...win(wx2, 4, false, wB));
+  const mins = now.getMinutes(), hrs = (now.getHours() % 12) + mins / 60;
+  L.push(...ellipse(cx, cy, rr, rr, "#8e94b2"), ...ellipse(cx, cy, rr - 4, rr - 4, "#d8dcee"),
+    ...hand(rr - 5, (mins / 60) * 2 * Math.PI, "#2a2d44", 2), ...hand(Math.max(3, rr - 8), (hrs / 12) * 2 * Math.PI, "#2a2d44", 3), r(cx - 2, cy - 2, 4, 4, "#c0424e"));
 
-  // Clock between the windows and, when there is room, the blue sign under it.
-  const cx = two ? wx1 + wA + Math.floor(gap / 2) : snap(W * 0.5), cr = Math.min(14, Math.floor(gap / 2) - 2) || 14;
-  const rr = Math.max(8, cr);
-  L.push(...ellipse(cx, 26, rr, rr, "#8e94b2"), ...ellipse(cx, 26, rr - 4, rr - 4, "#d8dcee"), r(cx - 1, 26 - rr + 4, 2, rr - 3, "#2a2d44"), r(cx, 25, rr - 5, 2, "#2a2d44"), r(cx - 2, 24, 4, 4, "#c0424e"));
-  if (gap >= 44 && base - 48 >= 88) L.push(r(cx - 16, 48, 32, 32, "#2a2f4a"), r(cx - 12, 62, 24, 4, "#89b4fa"), r(cx - 2, 52, 4, 24, "#89b4fa"),
-    r(cx - 8, 54, 4, 4, "#89b4fa"), r(cx + 4, 54, 4, 4, "#89b4fa"), r(cx - 8, 70, 4, 4, "#89b4fa"), r(cx + 4, 70, 4, 4, "#89b4fa"));
+  // The sign under the clock: how many agents need you (red, blinking). Nothing when nobody does; the board has the rest.
+  if (Lo.sign && (opts.needYou ?? 0) > 0) {
+    const { x, y, w, h } = Lo.sign, n = opts.needYou;
+    {
+      L.push(r(x - 2, y - 2, w + 4, h + 4, "#f38ba8").loop("opacity", { from: 0.35, to: 1, period: 900, easing: "ease-in-out" }), r(x, y, w, h, "#3b1d2b"),
+        div().absolute().left(x).top(y).w(w).h(h - 6).flex().items_center().justify_center().font_family("JetBrains Mono").font_bold().text_size(n > 9 ? 13 : 16).text_color("#f38ba8").child(n > 99 ? "99+" : String(n)),
+        div().absolute().left(x).top(y + h - 11).w(w).h(9).flex().items_center().justify_center().font_family("JetBrains Mono").font_bold().text_size(6.5).text_color("#f5c2e7").child("NEED YOU"));
+    }
+  }
 
-  // The water cooler stands on the baseboard, left of the server rack.
-  L.push(r(cw + 2, base - 54, 16, 22, "#6fa8d6"), r(cw + 4, base - 52, 4, 10, "#a9d0ee"), r(cw, base - 32, 20, 32, "#b7bfd6"), r(cw, base - 32, 20, 4, "#d3d8ea"), r(cw + 8, base - 24, 4, 4, "#e8744f"));
+  // No room for the sign (a narrow office): the count rides on the clock as a small red badge instead.
+  if (!Lo.sign && (opts.needYou ?? 0) > 0) {
+    const n = opts.needYou, bx = cx + rr - 6, by = cy + rr - 8;
+    L.push(r(bx, by, 12, 10, "#f38ba8").loop("opacity", { from: 0.4, to: 1, period: 900, easing: "ease-in-out" }),
+      div().absolute().left(bx).top(by).w(12).h(10).flex().items_center().justify_center().font_family("JetBrains Mono").font_bold().text_size(7.5).text_color("#2a0f16").child(n > 9 ? "9+" : String(n)));
+  }
 
-  // A potted plant in the left corner and the tech corner in the right one.
-  const plant = (x) => [
-    r(x, base - 44, 10, 26, "#2f6e3b"), r(x + 8, base - 54, 10, 36, "#3a8247"), r(x + 18, base - 42, 10, 24, "#2f6e3b"), r(x + 4, base - 34, 6, 6, "#52a35f"),
-    r(x + 2, base - 18, 24, 18, "#8a5a3c"), r(x, base - 18, 28, 4, "#a06c48"),
-  ];
-  L.push(...plant(6), ...ledWall(rackX, rackW, base, isMusicPlaying));
+  // The water cooler stands on the baseboard, left of the server rack; a bubble rises in its jug now and then.
+  const cw = Lo.cw;
+  L.push(r(cw + 2, base - 54, 16, 22, "#6fa8d6"), r(cw + 4, base - 52, 4, 10, "#a9d0ee"), r(cw, base - 32, 20, 32, "#b7bfd6"), r(cw, base - 32, 20, 4, "#d3d8ea"), r(cw + 8, base - 24, 4, 4, "#e8744f"),
+    // Loop values are kept small and relative to a normally placed lane: Herdr doesn't scale loop values by the zoom, so a loop over
+    // absolute wall heights drifts (at zoom 1.2 this bubble floated a jug's height above the cooler).
+    div().absolute().left(cw + 10).top(base - 52).w(2).h(18).child(r(0, 16, 2, 2, "#e6f2fb").loop("top", { from: 16, to: 0, period: 2600, easing: "ease-in" })));
+
+  // The plant in the left corner is a little potted tree that grows with the work shipped today: a sapling with one leafy crown,
+  // then a new branch with its own cluster of leaves at 1, 4, 8, 13, 19 and 26 tasks, and pink blossoms from 30. While someone has
+  // waited on you for a long time it droops: the branches sag and the leaves yellow.
+  const shipped = Math.max(0, opts.shipped ?? 0), droop = Boolean(opts.droop);
+  const bark = "#6b4a32", barkHi = "#8a6444";
+  const dark = droop ? "#6e7a3a" : "#2f6e3b", mid = droop ? "#7d8a40" : "#3a8247", lite = droop ? "#a3a852" : "#5fb06b";
+  const px = 6, sag = droop ? 3 : 0, tx = px + 12;
+  // [from x, from y, tip x, tip y, crown size] relative to the pot's left edge and the baseboard; the first is the crown.
+  const BRANCHES = [[tx, -40, tx + 1, -50, 3], [tx, -30, px + 1, -36, 2], [tx + 2, -33, px + 21, -39, 2], [tx, -42, px + 1, -50, 2],
+    [tx + 2, -45, px + 22, -53, 2], [tx, -50, px + 5, -60, 2], [tx + 2, -52, px + 20, -63, 2]];
+  const STEPS = [1, 4, 8, 13, 19, 26], grown = 1 + STEPS.filter((n) => shipped >= n).length;
+  // the trunk, a touch thicker at the base
+  L.push(r(tx, base - 40, 3, 22, bark), r(tx, base - 40, 1, 22, barkHi), r(tx - 1, base - 22, 5, 4, bark));
+  const crowns = [];
+  BRANCHES.slice(0, grown).forEach(([fx, fy, ex, ey, size], i) => {
+    const ty = base + ey + (i ? sag * (i % 2 ? 1 : 2) : sag);
+    // the branch: 2px steps from the trunk out to its tip
+    if (i) {
+      const n = Math.max(Math.abs(ex - fx), Math.abs(ey - fy)) / 2;
+      for (let k = 0; k <= n; k++) L.push(r(Math.round(fx + ((ex - fx) * k) / n), Math.round(base + fy + ((ty - base - fy) * k) / n), 2, 2, bark));
+    }
+    crowns.push([ex, ty, size, i]);
+  });
+  // leafy clusters: a dark rounded blob, a mid layer and a few light leaves on top, bigger for the crown
+  for (const [cxp, cyp, size, i] of crowns) {
+    const w = size === 3 ? 16 : 11, h = size === 3 ? 12 : 9, x = cxp - Math.floor(w / 2), y = cyp - Math.floor(h / 2);
+    L.push(r(x + 2, y, w - 4, h, dark), r(x, y + 2, w, h - 4, dark), r(x + 2, y + 1, w - 5, h - 4, mid), r(x + 1, y + 3, w - 4, h - 6, mid),
+      r(x + 3, y + 1, 3, 2, lite), r(x + w - 6, y + 3, 3, 2, lite), r(x + 4 + (i % 3), y + h - 4, 2, 2, lite));
+    if (shipped >= 30 && !droop) L.push(r(x + 2 + ((i * 5) % (w - 4)), y + 1 + (i % 2) * 3, 3, 3, "#f5c2e7").loop("opacity", { from: 0.55, to: 1, period: 1600 + i * 170, easing: "ease-in-out" }));
+  }
+  // the pot
+  L.push(r(px + 2, base - 18, 24, 18, "#8a5a3c"), r(px, base - 18, 28, 4, "#a06c48"), r(px + 4, base - 14, 20, 1, "#6f472f"));
+
+  // The tech corner, with the office's load on the rack.
+  L.push(...ledWall(Lo.rackX, Lo.rackW, base, Boolean(opts.music), Math.max(0, opts.load ?? 0)));
 
   // Tiled floor: a dark base with a grid of 24px tiles, and a pool of window light under each window.
   L.push(r(0, yH, W, H - yH, "#242843"));
   for (let x = 0; x < W; x += 24) L.push(r(x, yH, 2, H - yH, "#1c1f36"));
   for (let y = yH + 4; y < H; y += 24) L.push(r(0, y, W, 2, "#1c1f36"));
-  for (const [wx, wl] of two ? [[wx1, wA], [wx2, wB]] : [[wx1, wA]]) for (let i = 0; i < 9; i++) L.push(r(wx + i * 6, yH + 8 + i * 8, Math.round(wl * 0.85), 8, "#ffffff07"));
+  for (const wn of wins) for (let i = 0; i < 9; i++) L.push(r(wn.x + i * 6, yH + 8 + i * 8, Math.round(wn.w * 0.85), 8, P.pool));
   L.push(r(0, yH, 4, H - yH, "#0d0f1a"), r(W - 4, yH, 4, H - yH, "#0d0f1a"), r(0, H - 4, W, 4, "#0d0f1a"));
 
   return div().absolute().left(0).top(0).w(W).h(H).overflow_hidden().children(L);

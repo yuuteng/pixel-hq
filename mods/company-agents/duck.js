@@ -26,8 +26,10 @@ const STEAM = "#FFFFFF";
 const BADGE = "#F4E9DC";
 const BADGE_TOP = "#8C4A33";
 
-// One species per agent program: Claude is the orange crab, Codex a blue terminal robot, OpenCode a penguin, Antigravity the rainbow arch, the rest sheep.
+// One species per agent program: Claude is the orange crab, Codex a blue terminal robot, OpenCode a penguin, Antigravity the rainbow arch,
+// Hermes the herald in a gold winged helmet, the rest sheep.
 const SPECIES = {
+  herald: { body: "#2F3346", shade: "#22263A", eye: "#F5F1E6", badge: "#E8B04A", wings: true },
   crab: { body: "#D97757", shade: "#B5593B", eye: "#2A1A14", badge: "#F4E9DC" },
   bot: { body: "#5B6CF0", shade: "#4553C9", eye: "#DDE4FF", badge: "#F4E9DC", bot: true, screen: "#1B2140", glyph: "#DDE4FF", legs: [88, 152], legW: 30 },
   penguin: { body: "#35425E", shade: "#2E3A52", eye: "#1B2130", badge: "#F2A33A", round: true },
@@ -36,6 +38,7 @@ const SPECIES = {
 };
 
 const AGENTS = [
+  { match: (k) => k.includes("hermes"), species: "herald", role: "Chief of Staff" },
   { match: (k) => k.includes("claude"), species: "crab", role: "Developer" },
   { match: (k) => k.includes("codex"), species: "bot", role: "Code Reviewer" },
   { match: (k) => k.includes("opencode"), species: "penguin", role: "Platform Engineer" },
@@ -120,6 +123,28 @@ const PENGUIN = [
 ];
 const PENGUIN_FEET = [[66, 206, 48, 12, "#F5A623"], [136, 206, 48, 12, "#F5A623"]];
 
+// Hermes: a gold helmet across the top of the head and a white wing on each side of it, flapping (fast when cheering or alarmed).
+// The wings stay inside the body group's 250 units so nothing is clipped.
+const GOLD = "#E8B04A", GOLD_DARK = "#B8862E", FEATHER = "#F5F1E6", FEATHER_SHADE = "#C9C3B4";
+function heraldHelmet(rect, motion, px, { cheer, typing, urging, fast = (ms) => ms }) {
+  const wing = (side) => {
+    const x = (v, w) => (side < 0 ? v : 250 - v - w);
+    return div().absolute().left(0).top(0).w(px(1)).h(px(1))
+      .child(rect(x(0, 25), 2, 25, 10, FEATHER))
+      .child(rect(x(5, 20), 12, 20, 10, FEATHER))
+      .child(rect(x(11, 14), 22, 14, 8, FEATHER_SHADE));
+  };
+  const period = cheer || urging ? 240 : typing ? fast(520) : 1100;
+  const flap = (el) => motion(el, "top", { from: px(0), to: px(-5), period, easing: "ease-in-out" });
+  return [
+    rect(25, 0, 200, 24, GOLD),
+    rect(25, 24, 200, 6, GOLD_DARK),
+    rect(115, 0, 20, 24, "#F4CB6E"),
+    flap(wing(-1)),
+    flap(wing(1)),
+  ];
+}
+
 const ROOM = 118; // desk props reach left of the body group
 const WIDTH = ROOM + 250;
 const HEIGHT = 240;
@@ -160,7 +185,9 @@ export function duck(status, height, waited = 0) {
 }
 
 // One mood; `still` draws it without any motion.
-export function duckMood(m, height, { still = false, species = "crab" } = {}) {
+// `pace` (1 to 2) speeds the typing up when more is going on at the desk (sub-agents, shell jobs).
+export function duckMood(m, height, { still = false, species = "crab", pace = 1 } = {}) {
+  const fast = (ms) => Math.round(ms / Math.max(1, Math.min(2, pace)));
   const sp = SPECIES[species] ?? SPECIES.crab;
   const BODY = sp.body, SHADE = sp.shade, EYE = sp.eye, BADGE = sp.badge;
   const s = height / HEIGHT;
@@ -218,8 +245,8 @@ export function duckMood(m, height, { still = false, species = "crab" } = {}) {
   let leftClaw = rect(LX, 122, CW, 40, SHADE);
   let rightClaw = rect(RX, 122, CW, 40, SHADE);
   if (typing) {
-    leftClaw = motion(rect(LX, 122, CW, 40, SHADE), "top", { from: px(122), to: px(110), period: 240, easing: "ease-in-out" });
-    rightClaw = motion(rect(RX, 122, CW, 40, SHADE), "top", { from: px(110), to: px(122), period: 240, easing: "ease-in-out" });
+    leftClaw = motion(rect(LX, 122, CW, 40, SHADE), "top", { from: px(122), to: px(110), period: fast(240), easing: "ease-in-out" });
+    rightClaw = motion(rect(RX, 122, CW, 40, SHADE), "top", { from: px(110), to: px(122), period: fast(240), easing: "ease-in-out" });
   } else if (waving) {
     rightClaw = motion(rect(RX, 55, CW, 85, SHADE), "top", { from: px(48), to: px(66), period: urgent ? 260 : 480, easing: "ease-in-out" });
   } else if (cheer) {
@@ -235,7 +262,7 @@ export function duckMood(m, height, { still = false, species = "crab" } = {}) {
   if (typing) {
     // Sitting behind a MacBook: we see the silver lid with its glowing apple, the screen's light on the face.
     const SILVER = "#c9ced6", EDGE = "#a7adb8", DECK = "#aeb4c0";
-    const glow = motion(rect(40, 56, 170, 44, "#8fd0ff"), "opacity", { from: 0.06, to: 0.2, period: 900, easing: "ease-in-out" });
+    const glow = motion(rect(40, 56, 170, 44, "#8fd0ff"), "opacity", { from: 0.06, to: 0.2, period: fast(900), easing: "ease-in-out" });
     // The lid shows the maker's logo: the white apple, or for Antigravity its rainbow arch.
     const lid = sp.arch
       ? div().absolute().left(0).top(0).w(1).h(1)
@@ -333,6 +360,7 @@ export function duckMood(m, height, { still = false, species = "crab" } = {}) {
     .when(Boolean(sp.ears), (el) => el.child(rect(25, 0, 42, 38, SHADE)).child(rect(183, 0, 42, 38, SHADE)))
     .when(Boolean(sp.patch), (el) => el.child(rect(40, 32, 56, 60, sp.patch)).child(rect(146, 32, 56, 60, sp.patch)))
     .when(Boolean(sp.face), (el) => el.child(rect(64, 22, 112, 88, sp.face)).child(rect(14, 40, 26, 18, sp.face)).child(rect(200, 40, 26, 18, sp.face)))
+    .when(Boolean(sp.wings), (el) => el.children(heraldHelmet(rect, motion, px, { cheer, typing, urging, fast })))
     .children(eyes2)
     // company badge on a lanyard, hanging at the right side of the chest
     .when(!sp.bot && !sp.arch && !sp.round, (el) => el.child(rect(181, 82, 6, 38, BADGE_TOP)).child(rect(163, 120, 42, 56, BADGE)).child(rect(163, 120, 42, 12, BADGE_TOP)).child(rect(174, 140, 20, 16, SHADE)).child(rect(170, 162, 28, 6, SHADE)))
@@ -343,7 +371,7 @@ export function duckMood(m, height, { still = false, species = "crab" } = {}) {
       ? motion(group, "top", { from: 0, to: px(3), period: 160, easing: "linear" })
       : snoozing
         ? motion(group, "top", { from: 0, to: px(8), period: 1800, easing: "ease-in-out" })
-        : motion(group, "top", { from: 0, to: px(typing ? 3 : 7), ...(typing ? { period: 480, easing: "ease-in-out" } : BOB) });
+        : motion(group, "top", { from: 0, to: px(typing ? 3 : 7), ...(typing ? { period: fast(480), easing: "ease-in-out" } : BOB) });
 
   // Four little legs.
   let legs = sp.round
