@@ -46,11 +46,12 @@ const AGENTS = [
 ];
 // Job by tab name, for agents only: the first role whose word is in the name wins.
 const ROLES = [
-  { words: ["alert", "oncall", "incident"], species: "penguin", role: "On-call Engineer" },
+  { words: ["alert", "oncall", "incident"], species: "herald", role: "On-call Engineer" },
   { words: ["qa", "test"], species: "penguin", role: "QA Engineer" },
   { words: ["review", "cr"], species: "bot", role: "Code Reviewer" },
   { words: ["plan", "arch"], species: "arch", role: "Architect" },
-  { words: ["pm", "product", "doc", "note"], species: "sheep", role: "Product Manager" },
+  { words: ["pm", "product"], species: "sheep", role: "Product Manager" },
+  { words: ["doc", "note", "report"], species: "herald", role: "Chief of Staff" },
   { words: ["dev"], species: "crab", role: "Developer" },
 ];
 export function agentOf(key, tabName) {
