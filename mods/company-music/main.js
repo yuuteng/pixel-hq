@@ -1624,7 +1624,7 @@ export default class CompanyMusic extends View {
                     .px(9)
                     .items_center()
                     .cursor_pointer()
-                    .children(box("#a6e3a1", "#a6e3a122", "#11111b"))
+                    .children(box("#a6e3a1", "#30383d", "#11111b"))
                     .hover((s) => s.text_color("#ffffff"))
                     .on_click((_e, cx) => this.resume(cx))
                     .child(
@@ -1645,7 +1645,7 @@ export default class CompanyMusic extends View {
                     .px(9)
                     .items_center()
                     .cursor_pointer()
-                    .children(box("#f38ba8", "#f38ba822", "#11111b"))
+                    .children(box("#f38ba8", "#3a2c3e", "#11111b"))
                     .hover((s) => s.text_color("#ffffff"))
                     .on_click((_e, cx) => this.stop(cx))
                     .child(
