@@ -54,11 +54,11 @@ def print_terminals():
         v["ticket"] = v["ticket"] or (mentioned[0] if mentioned else None)
         v["tickets"] = list(dict.fromkeys(([v["ticket"]] if v["ticket"] else []) + mentioned))
     resume_lost(terminals, shells, running)
-    print(json.dumps({"terminals": terminals}))
+    print(json.dumps({"terminals": terminals, "config": sessionlib.PUBLIC_CONFIG}))
 
 
 def pr_tickets(session_ids):
-    """The PROJ keys in the titles of my PRs each session mentioned, the last mentioned first.
+    """The ticket keys in the titles of my PRs each session mentioned, the last mentioned first.
     Reads transcripts incrementally and PR titles from the cache only, so it stays cheap enough to poll."""
     try:
         state = json.loads(TICKET_STATE.read_text())
@@ -174,7 +174,7 @@ def session_of(address):
 def print_prs(address, fresh=False):
     session = session_of(address)
     if not session:
-        return print(json.dumps({"session": None, "ticket": None, "prs": []}))
+        return print(json.dumps({"session": None, "ticket": None, "prs": [], "config": sessionlib.PUBLIC_CONFIG}))
     sid = session["sessionId"]
     prs = my_prs(transcript_prs(sid), fresh)
     name = session.get("name") or sid[:8]
@@ -182,7 +182,8 @@ def print_prs(address, fresh=False):
     named = sessionlib.TICKET_RE.search(name)
     order = list(dict.fromkeys(([named.group(1).upper()] if named else []) + mentioned))
     ticket = session_ticket(order[0]) if order else None
-    print(json.dumps({"session": name, "ticket": ticket, "prs": prs, "tickets": ticket_tabs(sid, prs, order)}))
+    print(json.dumps({"session": name, "ticket": ticket, "prs": prs, "tickets": ticket_tabs(sid, prs, order),
+                      "config": sessionlib.PUBLIC_CONFIG}))
 
 
 def ticket_tabs(session_id, prs, order):
@@ -207,7 +208,7 @@ def branch_tickets(session_id):
     for path in transcripts(session_id):
         with path.open(errors="replace") as fh:
             for line in fh:
-                if '"tool_use"' not in line or "PROJ-" not in line:
+                if '"tool_use"' not in line or not sessionlib.TICKET_RE.search(line):
                     continue
                 try:
                     d = json.loads(line)

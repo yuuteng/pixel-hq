@@ -1,4 +1,7 @@
-"""Stash, Jira-cache and herdr helpers for the Pixel HQ PR panel, with no dependency outside this folder."""
+"""Stash, Jira and herdr helpers for the Pixel HQ PR panel, with no dependency outside this folder.
+
+The Jira and Stash addresses and the Jira project keys come from ~/.config/pixel-hq/tickets.json
+(see tickets.example.json). Without that file the panel shows no ticket and no PR."""
 import json
 import os
 import re
@@ -11,14 +14,30 @@ from pathlib import Path
 HOME = Path.home()
 CACHE_DIR = HOME / ".cache/pixel-hq-prs"
 JIRAFLOW_DB = HOME / ".config/jiraflow/state.db"
-JIRA_URL = "https://jira.example.com"
+CONFIG_FILE = HOME / ".config/pixel-hq/tickets.json"
+
+
+def load_config():
+    try:
+        config = json.loads(CONFIG_FILE.read_text())
+    except (OSError, ValueError):
+        return {}
+    return config if isinstance(config, dict) else {}
+
+
+CONFIG = load_config()
+JIRA_URL = str(CONFIG.get("jira_url") or "").rstrip("/")
+PROJECTS = [str(p) for p in CONFIG.get("ticket_projects") or [] if re.fullmatch(r"[A-Za-z][A-Za-z0-9]*", str(p))]
+KEY = rf"(?:{'|'.join(PROJECTS)})-\d+"
+PUBLIC_CONFIG = {"jira_url": JIRA_URL, "ticket_projects": PROJECTS}
 JIRA_CACHE = CACHE_DIR / "jira.json"
 JIRA_TTL = 600
-STASH_URL = "https://bitbucket.example.com"
+STASH_URL = str(CONFIG.get("stash_url") or "").rstrip("/")
 STASH_API = f"{STASH_URL}/rest/api/1.0"
-TICKET_RE = re.compile(r"\b(PROJ-\d+)\b", re.I)
+TICKET_RE = re.compile(rf"\b({KEY})\b" if PROJECTS else r"(?!)()", re.I)
 PR_RE = re.compile(r"/projects/([^/]+)/repos/([^/]+)/pull-requests/(\d+)")
-BRANCH_RE = re.compile(r"\b(?:feat|feature|fix|bugfix|hotfix|chore|docs|refactor|no-bump)/(PROJ-\d+)[\w.-]*", re.I)
+BRANCH_RE = re.compile(
+    rf"\b(?:feat|feature|fix|bugfix|hotfix|chore|docs|refactor|no-bump)/({KEY})[\w.-]*" if PROJECTS else r"(?!)()", re.I)
 BRANCH_CMD_RE = re.compile(r"\bgit\b.*\b(?:push|switch\s+(?:-q\s+)?-c|checkout\s+-b|branch\s+-m|worktree\s+add)\b", re.S)
 BOT_RE = re.compile(r"robot|service-user|bot$|^svc", re.I)
 TOKEN_FILES = (".zshrc", ".zprofile", ".zshenv", ".bash_tokens", ".bashrc")
@@ -55,7 +74,7 @@ def stash_user():
     except OSError:
         pass
     token = os.environ.get("STASH_TOKEN")
-    if not token:
+    if not token or not STASH_URL:
         return None
     res = subprocess.run(
         ["curl", "-s", "-m", "15", "-D", "-", "-o", "/dev/null",
@@ -72,7 +91,7 @@ def stash_user():
 
 def stash_get(url):
     token = os.environ.get("STASH_TOKEN")
-    if not token:
+    if not token or not STASH_URL:
         return None
     try:
         res = subprocess.run(
@@ -132,7 +151,7 @@ def ticket_info(key):
     if hit and time.time() - hit.get("at", 0) < JIRA_TTL:
         return hit
     token = os.environ.get("JIRA_TOKEN")
-    if not token:
+    if not token or not JIRA_URL:
         return hit or {}
     try:
         res = subprocess.run(

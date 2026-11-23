@@ -1,0 +1,5 @@
+{
+  "jira_url": "https://jira.example.com",
+  "stash_url": "https://bitbucket.example.com",
+  "ticket_projects": ["PROJ"]
+}

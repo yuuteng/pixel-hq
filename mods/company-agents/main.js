@@ -11,7 +11,13 @@ import { Editor } from "./editor.js";
 import { checkPixelHqUpdate, executePixelHqUpdate } from "./updater.js";
 import { snapshot, clashes, hire, agentTaskArgv } from "./crew.js";
 
-const JIRA = "https://jira.example.com";
+// Jira address and project keys, read by company-prs/sessions.py from ~/.config/pixel-hq/tickets.json.
+const ticketCfg = () => shared("pixel-hq.config") ?? {};
+const ticketIn = (text) => {
+  const keys = (ticketCfg().ticket_projects ?? []).join("|");
+  return keys ? (String(text ?? "").match(new RegExp(`\\b(?:${keys})-\\d+\\b`, "i"))?.[0]?.toUpperCase() ?? null) : null;
+};
+const openTicket = (key) => { const base = ticketCfg().jira_url; if (base) exec("open", [`${base}/browse/${key}`]).catch(() => null); };
 
 // The figure editor, as a dialog; `space` opens it on that space's pick.
 const openFigures = (space) => openOverlay({ mod: "company-agents", kind: "dialog", width: 860, height: 640, props: { figures: true, ...(space ? { space } : {}) } });
@@ -1078,7 +1084,9 @@ export default class Agents extends View {
       this.polling = false;
       if (r?.code !== 0) return;
       let next;
-      try { next = JSON.parse(r.stdout).terminals ?? {}; } catch { return; }
+      let config;
+      try { const out = JSON.parse(r.stdout); next = out.terminals ?? {}; config = out.config ?? {}; } catch { return; }
+      if (JSON.stringify(config) !== JSON.stringify(shared("pixel-hq.config") ?? null)) setShared("pixel-hq.config", config);
       if (JSON.stringify(next) === JSON.stringify(this.sessions)) return;
       this.sessions = next;
       setShared("pixel-hq.sessions", next);
@@ -1086,16 +1094,16 @@ export default class Agents extends View {
     });
   }
 
-  // PROJ key from the Claude session name, else from the tab name.
+  // Ticket key from the Claude session name, else from the tab name.
   ticketOf(a) {
-    return this.sessions[a.address]?.ticket ?? (tabNameOf(a).match(/\bPROJ-\d+\b/i)?.[0]?.toUpperCase() ?? null);
+    return this.sessions[a.address]?.ticket ?? ticketIn(tabNameOf(a));
   }
 
   // Every ticket of the session, the one picked in the PRs panel first.
   ticketsOf(a) {
     const first = this.ticketOf(a);
     const picked = shared("pixel-hq.ticket-tab")?.[a.address];
-    const shown = /^PROJ-\d+$/.test(picked ?? "") ? picked : first;
+    const shown = picked && picked !== "other" ? picked : first;
     const all = this.sessions[a.address]?.tickets ?? [];
     return shown ? [shown, ...[...new Set([first, ...all])].filter((k) => k && k !== shown)] : [];
   }
@@ -1532,7 +1540,7 @@ export default class Agents extends View {
             .bg("#89b4fa26").font_family(monoF).text_color("#89b4fa").cursor_pointer().hover((h) => h.bg("#89b4fa40"))
             .tooltip(otherTickets.length ? `Open ${ticket} in Jira\nAlso on this session\n${otherTickets.join("\n")}` : `Open ${ticket} in Jira`)
             .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-            .on_click((_e, cx) => { cx.stop_propagation(); exec("open", [`${JIRA}/browse/${ticket}`]).catch(() => null); })
+            .on_click((_e, cx) => { cx.stop_propagation(); openTicket(ticket); })
             .child(otherTickets.length ? `${ticket} +${otherTickets.length}` : ticket)))
           .when(Boolean(modelTxt), (el) => el.child(div().min_w(0).truncate().text_color(t.dim).child(ticket ? `· ${modelTxt}` : modelTxt)))))
         .when(ctx != null && cellW >= 90, (el) => el.child(div().mt(2).max_w(Math.max(petW + 22, cellW - 4)).child(vitalsBars(t, ctx, `farm-vitals-${a.address}`, Math.max(petW + 22, cellW - 4)))));

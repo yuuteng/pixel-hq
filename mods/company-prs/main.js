@@ -4,7 +4,6 @@ import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 import { focused, exec, appHome, theme, checking, shared, setShared } from "herdr";
 
-const JIRA = "https://jira.example.com";
 const CI = {
   failed: ["✕", "#f38ba8", "CI failed · click to open the build"],
   inprogress: ["●", "#f9e2af", "CI running · click to open the build"],
@@ -104,6 +103,12 @@ export default class Prs extends View {
     cx.timer.after(40, (cx) => { this.entering = false; cx.notify(); });
   }
 
+  // A PR title without the ticket key it starts with.
+  untitled(title) {
+    const keys = (this.data.config?.ticket_projects ?? []).join("|");
+    return keys ? title.replace(new RegExp(`^(?:${keys})-\\d+[:\\s]+`, "i"), "") : title;
+  }
+
   copyButton(t, prs) {
     const ready = prs.filter((p) => p.state === "OPEN" && !p.draft);
     const copied = this.copiedAt && Date.now() - this.copiedAt < 1500;
@@ -177,14 +182,14 @@ export default class Prs extends View {
             .on_click((_e, cx) => { cx.stop_propagation(); open(p.ci_url); }))
           .child(c[0]))
         .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(p.state === "OPEN" ? t.foreground : t.muted)
-          .child((p.title ?? "").replace(/^PROJ-\d+[:\s]+/i, "")))
+          .child(this.untitled(p.title ?? "")))
         .child(div().flex_none().px(5).h(16).rounded(4).flex().items_center().text_size(10).font_semibold()
           .bg(tone(t, p) + "26").text_color(tone(t, p)).child(shortLabel(p)));
     };
     const cat = ticket?.category === "Done" ? "#a6e3a1" : ticket?.category === "In Progress" ? "#f9e2af" : t.dim;
     const ticketCard = ticket && v_flex().id("ticket").mx(8).mb(4).px(10).py(7).gap(3).rounded(8).bg(t.surface ?? t.hover)
       .cursor_pointer().hover((el) => el.opacity(0.85)).tooltip(`Open ${ticket.key} in Jira`)
-      .on_click(() => open(`${JIRA}/browse/${ticket.key}`))
+      .on_click(() => { const base = this.data.config?.jira_url; if (base) open(`${base}/browse/${ticket.key}`); })
       .child(h_flex().gap(6).items_center().text_size(11.5)
         .child(div().flex_none().font_semibold().text_color("#89b4fa").child(ticket.key))
         .child(div().flex_1())

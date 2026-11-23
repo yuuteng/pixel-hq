@@ -5,15 +5,21 @@ import { panes, props, run, theme, home, layout, spaces, shared, exec } from "he
 import { agentOf, duckMood, duckWidth, mood } from "./duck.js";
 
 const tabNameOf = (p) => { const tb = spaces().flatMap((s) => s.tabs).find((x) => x.id === p.tab); return tb?.named ? tb.name : ""; };
-const JIRA = "https://jira.example.com";
-// PROJ key from the Claude session name (polled by company-agents), else from the tab name.
-const ticketOf = (p) => shared("pixel-hq.sessions")?.[p.terminal]?.ticket ?? (tabNameOf(p).match(/\bPROJ-\d+\b/i)?.[0]?.toUpperCase() ?? null);
+// Jira address and project keys, read by company-prs/sessions.py from ~/.config/pixel-hq/tickets.json.
+const ticketCfg = () => shared("pixel-hq.config") ?? {};
+const ticketIn = (text) => {
+  const keys = (ticketCfg().ticket_projects ?? []).join("|");
+  return keys ? (String(text ?? "").match(new RegExp(`\\b(?:${keys})-\\d+\\b`, "i"))?.[0]?.toUpperCase() ?? null) : null;
+};
+const openTicket = (key) => { const base = ticketCfg().jira_url; if (base) exec("open", [`${base}/browse/${key}`]).catch(() => null); };
+// Ticket key from the Claude session name (polled by company-agents), else from the tab name.
+const ticketOf = (p) => shared("pixel-hq.sessions")?.[p.terminal]?.ticket ?? ticketIn(tabNameOf(p));
 // Every ticket of the session, the one picked in the PRs panel first.
 const ticketsOf = (p) => {
   const all = shared("pixel-hq.sessions")?.[p.terminal]?.tickets ?? [];
   const first = ticketOf(p);
   const picked = shared("pixel-hq.ticket-tab")?.[p.terminal];
-  const shown = /^PROJ-\d+$/.test(picked ?? "") ? picked : first;
+  const shown = picked && picked !== "other" ? picked : first;
   return shown ? [shown, ...[...new Set([first, ...all])].filter((k) => k && k !== shown)] : [];
 };
 const ROLE = (p) => agentOf(p.program?.key, tabNameOf(p))?.role ?? (p.program?.shell ? "Terminal" : (p.program?.name ?? "Contractor"));
@@ -88,7 +94,7 @@ export default class CompanyPane extends View {
         .when(Boolean(ticket), el => el.child(div().id(`ph-tk-${pane}`).flex_none().px(7).h(19).flex().items_center().rounded(5)
           .bg("#89b4fa26").text_size(10.5).font_semibold().text_color("#89b4fa").cursor_pointer().hover(s => s.bg("#89b4fa40"))
           .tooltip(`Open ${ticket} in Jira`)
-          .on_click((_e, cx) => { cx.stop_propagation(); exec("open", [`${JIRA}/browse/${ticket}`]).catch(() => null); })
+          .on_click((_e, cx) => { cx.stop_propagation(); openTicket(ticket); })
           .child(ticket)))
         .when(others.length > 0, el => el.child(div().id(`ph-tk-more-${pane}`).flex_none().px(6).h(19).flex().items_center().rounded(5)
           .bg(t.border).text_size(10.5).font_semibold().text_color(t.dim)
