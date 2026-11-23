@@ -1091,6 +1091,15 @@ export default class Agents extends View {
     return this.sessions[a.address]?.ticket ?? (tabNameOf(a).match(/\bPROJ-\d+\b/i)?.[0]?.toUpperCase() ?? null);
   }
 
+  // Every ticket of the session, the one picked in the PRs panel first.
+  ticketsOf(a) {
+    const first = this.ticketOf(a);
+    const picked = shared("pixel-hq.ticket-tab")?.[a.address];
+    const shown = /^PROJ-\d+$/.test(picked ?? "") ? picked : first;
+    const all = this.sessions[a.address]?.tickets ?? [];
+    return shown ? [shown, ...[...new Set([first, ...all])].filter((k) => k && k !== shown)] : [];
+  }
+
   render(cx) {
     const t = theme();
     if (props()?.sortMenu) return this.sortMenu(t);
@@ -1411,7 +1420,7 @@ export default class Agents extends View {
       const text = more ?? a.space_name ?? label(a);
       // The desk's branch (its own worktree, ideally) and whether another desk is about to step on it.
       const branch = paneBy.get(a.pane)?.branch ?? null;
-      const ticket = this.ticketOf(a);
+      const [ticket, ...otherTickets] = this.ticketsOf(a);
       const cl = this.clash.get(a.address) ?? null;
       const clText = cl ? (cl.kind === "file" ? `clash: ${String(cl.files[0] ?? "").split("/").pop()}${cl.files.length > 1 ? ` +${cl.files.length - 1}` : ""}` : "same folder") : "";
       const clTip = cl ? (cl.kind === "file" ? `Another desk also changed ${cl.files.join(", ")}` : "Another desk is working in this same folder") : "";
@@ -1521,10 +1530,10 @@ export default class Agents extends View {
         .when(Boolean(ticket) || Boolean(modelTxt), (el) => el.child(h_flex().mt(2).gap(3).items_center().max_w(Math.max(petW + 22, cellW - 4)).text_size(9.5)
           .when(Boolean(ticket), (el) => el.child(div().id(`tk-${a.address}`).flex_none().px(5).h(14).flex().items_center().rounded(3)
             .bg("#89b4fa26").font_family(monoF).text_color("#89b4fa").cursor_pointer().hover((h) => h.bg("#89b4fa40"))
-            .tooltip(`Open ${ticket} in Jira`)
+            .tooltip(otherTickets.length ? `Open ${ticket} in Jira\nAlso on this session\n${otherTickets.join("\n")}` : `Open ${ticket} in Jira`)
             .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
             .on_click((_e, cx) => { cx.stop_propagation(); exec("open", [`${JIRA}/browse/${ticket}`]).catch(() => null); })
-            .child(ticket)))
+            .child(otherTickets.length ? `${ticket} +${otherTickets.length}` : ticket)))
           .when(Boolean(modelTxt), (el) => el.child(div().min_w(0).truncate().text_color(t.dim).child(ticket ? `· ${modelTxt}` : modelTxt)))))
         .when(ctx != null && cellW >= 90, (el) => el.child(div().mt(2).max_w(Math.max(petW + 22, cellW - 4)).child(vitalsBars(t, ctx, `farm-vitals-${a.address}`, Math.max(petW + 22, cellW - 4)))));
     });

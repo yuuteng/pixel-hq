@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import sessionlib  # noqa: E402
 
 sessionlib.load_token("STASH_TOKEN")
+sessionlib.load_token("JIRA_TOKEN")
 
 SESSIONS_DIR = Path.home() / ".claude/sessions"
 PROJECTS_DIR = Path.home() / ".claude/projects"
@@ -47,15 +48,17 @@ def print_terminals():
         match = sessionlib.TICKET_RE.search(name)
         terminals[t["address"]] = {"id": s["sessionId"], "name": name, "cwd": s.get("cwd"),
                                    "ticket": match.group(1).upper() if match else None}
-    talked = pr_tickets([v["id"] for v in terminals.values() if not v["ticket"]])
+    talked = pr_tickets([v["id"] for v in terminals.values()])
     for v in terminals.values():
-        v["ticket"] = v["ticket"] or talked.get(v["id"])
+        mentioned = talked.get(v["id"], [])
+        v["ticket"] = v["ticket"] or (mentioned[0] if mentioned else None)
+        v["tickets"] = list(dict.fromkeys(([v["ticket"]] if v["ticket"] else []) + mentioned))
     resume_lost(terminals, shells, running)
     print(json.dumps({"terminals": terminals}))
 
 
 def pr_tickets(session_ids):
-    """For sessions named without a ticket: the PROJ key in the title of the PR the session mentioned last.
+    """The PROJ keys in the titles of my PRs each session mentioned, the last mentioned first.
     Reads transcripts incrementally and PR titles from the cache only, so it stays cheap enough to poll."""
     try:
         state = json.loads(TICKET_STATE.read_text())
@@ -98,13 +101,18 @@ def pr_tickets(session_ids):
         tmp.write_text(json.dumps(state))
         tmp.replace(TICKET_STATE)
     cache = read_cache()
+    me = sessionlib.stash_user()
     out = {}
     for sid in session_ids:
+        found = []
         for key in reversed((state.get(sid) or {}).get("prs", [])):
-            match = sessionlib.TICKET_RE.search((cache.get(key) or {}).get("title") or "")
-            if match:
-                out[sid] = match.group(1).upper()
-                break
+            pr = cache.get(key) or {}
+            if me and pr.get("author") != me:
+                continue
+            match = sessionlib.TICKET_RE.search(pr.get("title") or "")
+            if match and match.group(1).upper() not in found:
+                found.append(match.group(1).upper())
+        out[sid] = found
     return out
 
 
@@ -167,10 +175,57 @@ def print_prs(address, fresh=False):
     session = session_of(address)
     if not session:
         return print(json.dumps({"session": None, "ticket": None, "prs": []}))
-    prs = my_prs(transcript_prs(session["sessionId"]), fresh)
-    name = session.get("name") or session["sessionId"][:8]
-    ticket = session_ticket(name) or session_ticket(pr_tickets([session["sessionId"]]).get(session["sessionId"], ""))
-    print(json.dumps({"session": name, "ticket": ticket, "prs": prs}))
+    sid = session["sessionId"]
+    prs = my_prs(transcript_prs(sid), fresh)
+    name = session.get("name") or sid[:8]
+    mentioned = pr_tickets([sid]).get(sid, [])
+    named = sessionlib.TICKET_RE.search(name)
+    order = list(dict.fromkeys(([named.group(1).upper()] if named else []) + mentioned))
+    ticket = session_ticket(order[0]) if order else None
+    print(json.dumps({"session": name, "ticket": ticket, "prs": prs, "tickets": ticket_tabs(sid, prs, order)}))
+
+
+def ticket_tabs(session_id, prs, order):
+    """One entry per ticket of the session: the ones with a PR in `order`, then PRs without a ticket, then tickets with a branch only."""
+    by_ticket = {}
+    for pr in prs:
+        match = sessionlib.TICKET_RE.search(pr.get("title") or "")
+        by_ticket.setdefault(match.group(1).upper() if match else None, []).append(pr["key"])
+    keys = [k for k in order if k in by_ticket] + [k for k in by_ticket if k is not None and k not in order]
+    tabs = [session_ticket(k) | {"prs": by_ticket[k], "branches": []} for k in keys]
+    if None in by_ticket:
+        tabs.append({"key": None, "summary": None, "status": None, "category": None, "prs": by_ticket[None], "branches": []})
+    for key, branches in branch_tickets(session_id).items():
+        if key not in by_ticket:
+            tabs.append(session_ticket(key) | {"prs": [], "branches": branches})
+    return tabs
+
+
+def branch_tickets(session_id):
+    """Tickets named in the branches the session created or pushed, with those branches."""
+    found = {}
+    for path in transcripts(session_id):
+        with path.open(errors="replace") as fh:
+            for line in fh:
+                if '"tool_use"' not in line or "PROJ-" not in line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                if d.get("isSidechain"):
+                    continue
+                for block in (d.get("message") or {}).get("content") or []:
+                    if not isinstance(block, dict) or block.get("type") != "tool_use" or block.get("name") != "Bash":
+                        continue
+                    command = (block.get("input") or {}).get("command") or ""
+                    if not sessionlib.BRANCH_CMD_RE.search(command):
+                        continue
+                    for m in sessionlib.BRANCH_RE.finditer(command):
+                        branches = found.setdefault(m.group(1).upper(), [])
+                        if m.group(0) not in branches:
+                            branches.append(m.group(0))
+    return found
 
 
 def print_failed():
@@ -239,7 +294,7 @@ def session_ticket(name):
     if not match:
         return None
     key = match.group(1).upper()
-    info = sessionlib.jira_tickets().get(key, {})
+    info = sessionlib.ticket_info(key)
     return {"key": key, "summary": info.get("summary"), "status": info.get("status"), "category": info.get("category")}
 
 

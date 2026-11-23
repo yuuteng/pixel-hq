@@ -1,8 +1,8 @@
-// The focused Claude session's own PRs, with their Stash review state and CI, its Jira ticket, and the markdown files it wrote.
+// The focused Claude session's own PRs, one tab per Jira ticket, with their Stash review state and CI, and the markdown files it wrote.
 
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
-import { focused, exec, appHome, theme, checking } from "herdr";
+import { focused, exec, appHome, theme, checking, shared, setShared } from "herdr";
 
 const JIRA = "https://jira.example.com";
 const CI = {
@@ -13,6 +13,8 @@ const CI = {
 };
 const HELPER = () => `${appHome()}/mods/company-prs/sessions.py`;
 const open = (url) => exec("open", [url]).catch(() => null);
+const TAB = "pixel-hq.ticket-tab";
+const tabId = (k) => k ?? "other";
 
 function tone(t, pr) {
   if (pr.state === "MERGED") return "#cba6f7";
@@ -34,7 +36,8 @@ function shortLabel(pr) {
 export default class Prs extends View {
   init(_props, cx) {
     this.address = null;
-    this.data = { session: null, ticket: null, prs: [] };
+    this.data = { session: null, ticket: null, prs: [], tickets: [] };
+    this.branchOnly = localStorage.getItem("branchOnly") === "1";
     this.loading = false;
     this.docs = [];
     if (checking()) return;
@@ -83,6 +86,24 @@ export default class Prs extends View {
     });
   }
 
+  // Tickets shown as tabs: the ones with a PR, plus the ones with a branch only when the option is on.
+  tabs() {
+    return (this.data.tickets ?? []).filter((k) => k.prs.length > 0 || this.branchOnly);
+  }
+
+  current(tabs) {
+    const picked = shared(TAB)?.[this.address];
+    return tabs.find((k) => tabId(k.key) === picked) ?? tabs[0] ?? null;
+  }
+
+  pick(key, cx) {
+    if (tabId(key) === shared(TAB)?.[this.address]) return;
+    setShared(TAB, { ...(shared(TAB) ?? {}), [this.address]: tabId(key) });
+    this.entering = true;
+    cx.notify();
+    cx.timer.after(40, (cx) => { this.entering = false; cx.notify(); });
+  }
+
   copyButton(t, prs) {
     const ready = prs.filter((p) => p.state === "OPEN" && !p.draft);
     const copied = this.copiedAt && Date.now() - this.copiedAt < 1500;
@@ -101,9 +122,41 @@ export default class Prs extends View {
 
   render() {
     const t = theme();
-    const { session, ticket, prs } = this.data;
+    const { session } = this.data;
+    const tabs = this.tabs();
+    const cur = this.current(tabs);
+    const ticket = cur?.key ? cur : null;
+    const prs = cur ? this.data.prs.filter((p) => cur.prs.includes(p.key)) : [];
+    const hidden = (this.data.tickets ?? []).filter((k) => !k.prs.length).length;
     const repos = new Map();
     for (const p of prs) { if (!repos.has(p.repo)) repos.set(p.repo, []); repos.get(p.repo).push(p); }
+    const tab = (k) => {
+      const on = k === cur;
+      return h_flex().id(`tab-${tabId(k.key)}`).relative().flex_none().h(28).px(10).gap(6).items_center().rounded(7).border_1()
+        .border_color(k.prs.length ? t.chrome : t.dim).when(!k.prs.length, (el) => el.border_dashed())
+        .text_size(11.5).font_semibold().text_color(on ? "#89b4fa" : t.muted)
+        .cursor_pointer().hover((el) => el.bg(t.hover))
+        .tooltip(k.key ? `${k.key}${k.summary ? `\n${k.summary}` : ""}` : "PRs without a ticket in their title")
+        .on_click((_e, cx) => this.pick(k.key, cx))
+        .child(div().id(`tab-on-${tabId(k.key)}`).absolute().left(0).top(0).size_full().rounded(7).bg(t.surface ?? t.hover)
+          .opacity(on ? 1 : 0).transition("opacity", { duration: 220, easing: "ease-out" }))
+        .child(div().relative().child(k.key ?? "other"))
+        .child(div().relative().font_normal().text_color(t.dim).child(String(k.prs.length)));
+    };
+    const tabRow = tabs.length > 1 && h_flex().flex_none().flex_wrap().gap(4).px(8).pb(8).children(tabs.map(tab));
+    const option = Boolean(session) && h_flex().id("prs-branch-only").flex_none().mx(8).mb(6).px(8).h(28).gap(8).items_center().rounded(7)
+      .text_size(11).text_color(t.muted).cursor_pointer().hover((el) => el.bg(t.hover))
+      .tooltip("Also show the tickets this session has a branch for and no PR yet")
+      .on_click((_e, cx) => {
+        this.branchOnly = !this.branchOnly;
+        localStorage.setItem("branchOnly", this.branchOnly ? "1" : "0");
+        cx.notify();
+      })
+      .child(div().flex_none().w(13).h(13).rounded(4).border_1().border_color(this.branchOnly ? "#89b4fa" : t.dim)
+        .child(div().id("prs-branch-only-on").size_full().rounded(3).bg("#89b4fa")
+          .opacity(this.branchOnly ? 1 : 0).transition("opacity", { duration: 180, easing: "ease-out" })))
+      .child(div().flex_1().min_w(0).truncate().child("Tickets without a PR"))
+      .when(hidden > 0, (el) => el.child(div().flex_none().text_color(t.dim).child(String(hidden))));
     const head = h_flex().h(32).flex_none().px(12).items_center().gap(6).text_size(11.5).text_color(t.dim)
       .child(div().flex_none().font_semibold().text_color(t.muted).child("PRs"))
       .child(div().flex_1().min_w(0).truncate().text_color(t.muted).child(session ?? ""))
@@ -141,7 +194,8 @@ export default class Prs extends View {
     const body = !session
       ? [div().px(14).pt(6).text_size(12).text_color(t.dim).child("Focus a Claude session to see its PRs.")]
       : !prs.length
-        ? [div().px(14).pt(6).text_size(12).text_color(t.dim).child(this.loading ? "Loading…" : "No PRs of yours in this session.")]
+        ? [div().px(14).pt(6).text_size(12).text_color(t.dim).child(this.loading && !cur ? "Loading…" : cur ? "No PR yet." : "No PRs of yours in this session."),
+          ...(cur?.branches ?? []).map((b) => div().px(14).pt(4).text_size(11.5).text_color(t.muted).truncate().child(b))]
         : [...repos].flatMap(([repo, list]) => [
           div().px(8).pt(10).pb(3).text_size(11).text_color(t.dim).truncate().child(repo),
           ...[...list].sort((a, b) => (a.state === "OPEN" ? 0 : 1) - (b.state === "OPEN" ? 0 : 1) || b.number - a.number).map(row),
@@ -158,7 +212,13 @@ export default class Prs extends View {
     ] : [];
     return v_flex().size_full().min_h(0).bg(t.chrome).text_color(t.foreground).text_size(13)
       .child(head)
-      .when(Boolean(ticketCard), (el) => el.child(ticketCard))
-      .child(v_flex().flex_1().min_h(0).px(6).pb(14).overflow_y_scrollbar().children([...body, ...docs]));
+      .when(Boolean(tabRow), (el) => el.child(tabRow))
+      .when(Boolean(option), (el) => el.child(option))
+      .child(v_flex().id("prs-content").relative().flex_1().min_h(0)
+        .top(this.entering ? 8 : 0).opacity(this.entering ? 0 : 1)
+        .transition("top", { duration: this.entering ? 1 : 260, easing: "ease-out" })
+        .transition("opacity", { duration: this.entering ? 1 : 260, easing: "ease-out" })
+        .when(Boolean(ticketCard), (el) => el.child(ticketCard))
+        .child(v_flex().flex_1().min_h(0).px(6).pb(14).overflow_y_scrollbar().children([...body, ...docs])));
   }
 }

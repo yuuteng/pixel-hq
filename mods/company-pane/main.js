@@ -8,6 +8,14 @@ const tabNameOf = (p) => { const tb = spaces().flatMap((s) => s.tabs).find((x) =
 const JIRA = "https://jira.example.com";
 // PROJ key from the Claude session name (polled by company-agents), else from the tab name.
 const ticketOf = (p) => shared("pixel-hq.sessions")?.[p.terminal]?.ticket ?? (tabNameOf(p).match(/\bPROJ-\d+\b/i)?.[0]?.toUpperCase() ?? null);
+// Every ticket of the session, the one picked in the PRs panel first.
+const ticketsOf = (p) => {
+  const all = shared("pixel-hq.sessions")?.[p.terminal]?.tickets ?? [];
+  const first = ticketOf(p);
+  const picked = shared("pixel-hq.ticket-tab")?.[p.terminal];
+  const shown = /^PROJ-\d+$/.test(picked ?? "") ? picked : first;
+  return shown ? [shown, ...[...new Set([first, ...all])].filter((k) => k && k !== shown)] : [];
+};
 const ROLE = (p) => agentOf(p.program?.key, tabNameOf(p))?.role ?? (p.program?.shell ? "Terminal" : (p.program?.name ?? "Contractor"));
 
 function paneFrame(node) {
@@ -59,7 +67,7 @@ export default class CompanyPane extends View {
       : st === "blocked" ? chip("needs you", t.blocked ?? "#e8744f")
       : st === "done" ? chip("shipped", t.done ?? "#8ec07c")
       : species ? chip("on break", t.dim ?? "#9a8f86") : null;
-    const ticket = ticketOf(p);
+    const [ticket, ...others] = ticketsOf(p);
     return h_flex()
       .id(`pane-head-${pane}`)
       .size_full()
@@ -81,7 +89,11 @@ export default class CompanyPane extends View {
           .bg("#89b4fa26").text_size(10.5).font_semibold().text_color("#89b4fa").cursor_pointer().hover(s => s.bg("#89b4fa40"))
           .tooltip(`Open ${ticket} in Jira`)
           .on_click((_e, cx) => { cx.stop_propagation(); exec("open", [`${JIRA}/browse/${ticket}`]).catch(() => null); })
-          .child(ticket))))
+          .child(ticket)))
+        .when(others.length > 0, el => el.child(div().id(`ph-tk-more-${pane}`).flex_none().px(6).h(19).flex().items_center().rounded(5)
+          .bg(t.border).text_size(10.5).font_semibold().text_color(t.dim)
+          .tooltip(`Also on this session\n${others.join("\n")}`)
+          .child(`+${others.length}`))))
       .child(div().flex_1().truncate().text_color(t.dim).child(folder(p.cwd)))
       .when(Boolean(status), el => el.child(status))
       .when(this.hovered, el => el

@@ -5,15 +5,21 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import time
 from pathlib import Path
 
 HOME = Path.home()
 CACHE_DIR = HOME / ".cache/pixel-hq-prs"
 JIRAFLOW_DB = HOME / ".config/jiraflow/state.db"
+JIRA_URL = "https://jira.example.com"
+JIRA_CACHE = CACHE_DIR / "jira.json"
+JIRA_TTL = 600
 STASH_URL = "https://bitbucket.example.com"
 STASH_API = f"{STASH_URL}/rest/api/1.0"
 TICKET_RE = re.compile(r"\b(PROJ-\d+)\b", re.I)
 PR_RE = re.compile(r"/projects/([^/]+)/repos/([^/]+)/pull-requests/(\d+)")
+BRANCH_RE = re.compile(r"\b(?:feat|feature|fix|bugfix|hotfix|chore|docs|refactor|no-bump)/(PROJ-\d+)[\w.-]*", re.I)
+BRANCH_CMD_RE = re.compile(r"\bgit\b.*\b(?:push|switch\s+(?:-q\s+)?-c|checkout\s+-b|branch\s+-m|worktree\s+add)\b", re.S)
 BOT_RE = re.compile(r"robot|service-user|bot$|^svc", re.I)
 TOKEN_FILES = (".zshrc", ".zprofile", ".zshenv", ".bash_tokens", ".bashrc")
 
@@ -111,3 +117,40 @@ def jira_tickets():
     except sqlite3.Error:
         return {}
     return {k: {"summary": s, "status": st, "category": cat} for k, s, st, cat in rows}
+
+
+def ticket_info(key):
+    """Summary and status of a ticket: from the jira-flow cache, else from Jira, kept ten minutes."""
+    info = jira_tickets().get(key)
+    if info:
+        return info
+    try:
+        cache = json.loads(JIRA_CACHE.read_text())
+    except (OSError, ValueError):
+        cache = {}
+    hit = cache.get(key)
+    if hit and time.time() - hit.get("at", 0) < JIRA_TTL:
+        return hit
+    token = os.environ.get("JIRA_TOKEN")
+    if not token:
+        return hit or {}
+    try:
+        res = subprocess.run(
+            ["curl", "-sf", "-m", "10", "-H", f"Authorization: Bearer {token}",
+             f"{JIRA_URL}/rest/api/2/issue/{key}?fields=summary,status"],
+            capture_output=True, text=True, timeout=15,
+        )
+        fields = json.loads(res.stdout)["fields"] if res.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired, ValueError, KeyError):
+        fields = None
+    if not fields:
+        return hit or {}
+    status = fields.get("status") or {}
+    info = {"summary": fields.get("summary"), "status": status.get("name"),
+            "category": (status.get("statusCategory") or {}).get("name"), "at": time.time()}
+    cache[key] = info
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = JIRA_CACHE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(cache))
+    tmp.replace(JIRA_CACHE)
+    return info
