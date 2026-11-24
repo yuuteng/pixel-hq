@@ -234,7 +234,7 @@ export default class Prs extends View {
       .child(`+${hiddenTabs.length} hidden`);
     const tabRow = (tabs.length > 1 || hiddenTabs.length > 0) && h_flex().flex_none().flex_wrap().gap(4).px(8).pb(8)
       .children([...tabs.map(tab), ...(hiddenChip ? [hiddenChip] : []), ...(this.showHidden ? hiddenTabs.map(hiddenTab) : [])]);
-    const option = Boolean(session) && h_flex().id("prs-branch-only").flex_none().mx(8).mb(6).px(8).h(28).gap(8).items_center().rounded(7)
+    const option = Boolean(session) && h_flex().id("prs-branch-only").flex_none().px(8).h(28).gap(8).items_center().rounded(7)
       .text_size(11).text_color(t.muted).cursor_pointer().hover((el) => el.bg(t.hover))
       .tooltip("Also show the tickets this session has a branch for and no PR yet")
       .on_click((_e, cx) => {
@@ -245,9 +245,9 @@ export default class Prs extends View {
       .child(div().flex_none().w(13).h(13).rounded(4).border_1().border_color(this.branchOnly ? "#89b4fa" : t.dim)
         .child(div().id("prs-branch-only-on").size_full().rounded(3).bg("#89b4fa")
           .opacity(this.branchOnly ? 1 : 0).transition("opacity", { duration: 180, easing: "ease-out" })))
-      .child(div().flex_1().min_w(0).truncate().child("Tickets without a PR"))
+      .child(div().flex_none().child("Tickets without a PR"))
       .when(branchOnly > 0, (el) => el.child(div().flex_none().text_color(t.dim).child(String(branchOnly))));
-    const autoOption = Boolean(session) && h_flex().id("prs-auto-hide").flex_none().mx(8).mb(6).px(8).h(28).gap(8).items_center().rounded(7)
+    const autoOption = Boolean(session) && h_flex().id("prs-auto-hide").flex_none().px(8).h(28).gap(8).items_center().rounded(7)
       .text_size(11).text_color(t.muted).cursor_pointer().hover((el) => el.bg(t.hover))
       .tooltip("Hide a ticket once it is done in Jira and its PRs are merged")
       .on_click((_e, cx) => {
@@ -259,7 +259,7 @@ export default class Prs extends View {
       .child(div().flex_none().w(13).h(13).rounded(4).border_1().border_color(this.autoHide ? "#89b4fa" : t.dim)
         .child(div().id("prs-auto-hide-on").size_full().rounded(3).bg("#89b4fa")
           .opacity(this.autoHide ? 1 : 0).transition("opacity", { duration: 180, easing: "ease-out" })))
-      .child(div().flex_1().min_w(0).truncate().child("Hide finished tickets"));
+      .child(div().flex_none().child("Hide finished tickets"));
     const head = h_flex().h(32).flex_none().px(12).items_center().gap(6).text_size(11.5).text_color(t.dim)
       .child(div().flex_none().font_semibold().text_color(t.muted).child("PRs"))
       .child(div().flex_1().min_w(0).truncate().text_color(t.muted).child(session ?? ""))
@@ -316,8 +316,7 @@ export default class Prs extends View {
     return v_flex().size_full().min_h(0).bg(t.chrome).text_color(t.foreground).text_size(13)
       .child(head)
       .when(Boolean(tabRow), (el) => el.child(tabRow))
-      .when(Boolean(option), (el) => el.child(option))
-      .when(Boolean(autoOption), (el) => el.child(autoOption))
+      .when(Boolean(option), (el) => el.child(h_flex().flex_none().flex_wrap().mx(8).mb(6).gap(4).children([option, autoOption])))
       .child(v_flex().id("prs-content").relative().flex_1().min_h(0)
         .top(this.entering ? 8 : 0).opacity(this.entering ? 0 : 1)
         .transition("top", { duration: this.entering ? 1 : 260, easing: "ease-out" })
