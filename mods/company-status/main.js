@@ -1,6 +1,6 @@
 import { View, div, svg } from "gpui-kit";
 import { h_flex } from "gpui-base";
-import { spaces, panes, focused, agents, theme, run, window, keys, setBadge, openOverlay, shared, setShared, appHome, exec, checking, settings, readTextFile, writeTextFile } from "herdr";
+import { spaces, panes, focused, agents, theme, run, window, keys, setBadge, openOverlay, shared, setShared, appHome, exec, checking, settings, readTextFile, writeTextFile, notify } from "herdr";
 
 const MONO = "JetBrains Mono, Menlo, monospace";
 
@@ -140,6 +140,18 @@ export default class WorkspaceStatus extends View {
     });
     checkCi(cx);
     cx.timer.every(60000, checkCi);
+    // A toast when one of my open PRs is approved, sent back, commented, merged or fails its CI. A click goes to its session.
+    const checkPrs = (cx) => cx.spawn(async () => {
+      const r = await exec("python3", ["-I", `${appHome()}/mods/company-prs/sessions.py`, "changes"], { timeout: 60000 }).catch(() => null);
+      if (r?.code !== 0) return;
+      let events;
+      try { events = JSON.parse(r.stdout).events ?? []; } catch { return; }
+      for (const e of events) {
+        notify({ title: e.title, body: e.body, level: e.level, action: { name: "agent.focus", args: { terminal: e.terminal } } });
+      }
+    });
+    checkPrs(cx);
+    cx.timer.every(120000, checkPrs);
     cx.timer.every(3000, async (cx) => {
       if (this.polling || isMusicBoxDisabled()) return;
       const music = shared("pixel-hq.music");

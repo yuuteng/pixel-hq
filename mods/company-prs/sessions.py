@@ -20,13 +20,17 @@ PR_CACHE = sessionlib.CACHE_DIR / "prs.json"
 PR_TTL = 120
 PR_TTL_RUNNING = 20
 RESUME_STATE = Path.home() / ".local/state/pixel-hq-resume.json"
+PR_TTL_DECLINED = 3600
 TICKET_STATE = sessionlib.CACHE_DIR / "session-prs.json"
+NOTIFIED_STATE = sessionlib.CACHE_DIR / "notified.json"
 
 
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else "terminals"
     if cmd == "prs":
         return print_prs(sys.argv[2], fresh="--fresh" in sys.argv[3:])
+    if cmd == "changes":
+        return print_changes()
     if cmd == "docs":
         return print_docs(sys.argv[2])
     if cmd == "failed":
@@ -240,6 +244,56 @@ def print_failed():
     print(json.dumps({"failed": failed}))
 
 
+def print_changes():
+    """What happened to my open PRs since the last call: approval, needs work, comment, failed CI, merge.
+    A PR seen for the first time is recorded without an event."""
+    live = live_by_pid()
+    owners = {}
+    for t in live_terminals():
+        s = live.get((t.get("foreground") or {}).get("pid"))
+        for key in transcript_prs(s["sessionId"]) if s else []:
+            owners.setdefault(key, t["address"])
+    try:
+        seen = json.loads(NOTIFIED_STATE.read_text())
+    except (OSError, ValueError):
+        seen = {}
+    events = []
+    for pr in my_prs(list(owners)):
+        if "approved" not in pr:
+            continue
+        now = {f: pr[f] for f in ("state", "ci", "approved", "needs_work", "comments")}
+        before = seen.get(pr["key"])
+        if before == now:
+            continue
+        if before:
+            events += [e | {"terminal": owners[pr["key"]], "url": pr["url"]} for e in pr_events(pr, before, now)]
+        seen[pr["key"]] = now
+    NOTIFIED_STATE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = NOTIFIED_STATE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(seen))
+    tmp.replace(NOTIFIED_STATE)
+    print(json.dumps({"events": events}))
+
+
+def pr_events(pr, before, now):
+    name = f"#{pr['number']}"
+    where = pr["repo"]
+    if now["state"] != "OPEN":
+        merged = before["state"] == "OPEN" and now["state"] == "MERGED"
+        return [{"kind": "merged", "title": f"{name} merged", "body": where, "level": "success"}] if merged else []
+    events = []
+    for who in [u for u in now["needs_work"] if u not in before["needs_work"]]:
+        events.append({"kind": "needs_work", "title": f"{name} needs work", "body": f"{where} · {who}", "level": "warning"})
+    for who in [u for u in now["approved"] if u not in before["approved"]]:
+        events.append({"kind": "approved", "title": f"{name} approved", "body": f"{where} · {who}", "level": "success"})
+    if now["comments"] > before["comments"]:
+        events.append({"kind": "comment", "title": f"{name} new comment", "body": f"{where} · {pr.get('commenter') or ''}",
+                       "level": "info"})
+    if now["ci"] == "failed" and before["ci"] != "failed":
+        events.append({"kind": "ci", "title": f"{name} CI failed", "body": where, "level": "error"})
+    return events
+
+
 def my_prs(keys, fresh=False):
     cache = read_cache()
     stale = [k for k in keys if fresh or is_stale(cache.get(k))]
@@ -302,6 +356,10 @@ def session_ticket(name):
 def is_stale(entry):
     if not entry:
         return True
+    if entry.get("state") == "MERGED":
+        return False
+    if entry.get("state") == "DECLINED":
+        return time.time() - entry.get("at", 0) > PR_TTL_DECLINED
     ttl = PR_TTL_RUNNING if entry.get("ci") == "inprogress" else PR_TTL
     return time.time() - entry.get("at", 0) > ttl
 
@@ -346,6 +404,7 @@ def pr_info(key):
     author = pr.get("author", {}).get("user", {}).get("name")
     mine = author == sessionlib.stash_user()
     builds = commit_builds(pr.get("fromRef", {}).get("latestCommit")) if mine else []
+    human = sessionlib.human_comments(base) if mine else []
     return {
         "author": author,
         "repo": repo,
@@ -353,7 +412,11 @@ def pr_info(key):
         "title": pr.get("title"),
         "state": pr.get("state"),
         "draft": bool(pr.get("draft")),
-        "label": sessionlib.review_label(pr, base) if mine else "",
+        "label": sessionlib.review_label(pr, human) if mine else "",
+        "approved": sessionlib.reviewers(pr, "APPROVED"),
+        "needs_work": sessionlib.reviewers(pr, "NEEDS_WORK"),
+        "comments": len(human),
+        "commenter": human[0]["user"]["name"] if human else None,
         "ci": ci_state(builds),
         "ci_url": next((b["url"] for b in builds if b["state"] != "SUCCESSFUL"), builds[0]["url"] if builds else None),
         "url": f"{sessionlib.STASH_URL}/projects/{project}/repos/{repo}/pull-requests/{number}",

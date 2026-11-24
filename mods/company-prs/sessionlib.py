@@ -103,13 +103,21 @@ def stash_get(url):
         return None
 
 
-def review_label(pr, base):
+def reviewers(pr, status):
+    return sorted(r["user"]["name"] for r in pr.get("reviewers", []) if r["status"] == status)
+
+
+def human_comments(base):
+    """Comment activities of the PR written by someone else than me or a bot, the last one first."""
     me = stash_user()
     activities = (stash_get(f"{base}/activities?limit=100") or {}).get("values", [])
-    approved = sorted(r["user"]["name"] for r in pr.get("reviewers", []) if r["status"] == "APPROVED")
-    needs_work = sorted(r["user"]["name"] for r in pr.get("reviewers", []) if r["status"] == "NEEDS_WORK")
-    human = [a for a in activities
-             if a["action"] == "COMMENTED" and a["user"]["name"] != me and not BOT_RE.search(a["user"]["name"])]
+    return [a for a in activities
+            if a["action"] == "COMMENTED" and a["user"]["name"] != me and not BOT_RE.search(a["user"]["name"])]
+
+
+def review_label(pr, human):
+    approved = reviewers(pr, "APPROVED")
+    needs_work = reviewers(pr, "NEEDS_WORK")
     state = pr["state"]
     if state == "MERGED":
         return "merged"
