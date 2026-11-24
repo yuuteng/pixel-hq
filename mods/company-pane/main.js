@@ -34,13 +34,16 @@ const ticketIn = (text) => {
 const openTicket = (key) => { const base = ticketCfg().jira_url; if (base) exec("open", [`${base}/browse/${key}`]).catch(() => null); };
 // Ticket key from the Claude session name (polled by company-agents), else from the tab name.
 const ticketOf = (p) => shared("pixel-hq.sessions")?.[p.terminal]?.ticket ?? ticketIn(tabNameOf(p));
-// Every ticket of the session, the one picked in the PRs panel first.
+// Every ticket of the session not hidden in the PRs panel, the one picked there first.
 const ticketsOf = (p) => {
-  const all = shared("pixel-hq.sessions")?.[p.terminal]?.tickets ?? [];
+  const session = shared("pixel-hq.sessions")?.[p.terminal];
   const first = ticketOf(p);
+  const gone = new Set(shared("pixel-hq.ticket-hidden")?.[session?.id] ?? []);
+  const all = [...new Set([first, ...(session?.tickets ?? [])])].filter(Boolean);
+  const list = all.some((k) => !gone.has(k)) ? all.filter((k) => !gone.has(k)) : all.slice(0, 1);
   const picked = shared("pixel-hq.ticket-tab")?.[p.terminal];
-  const shown = picked && picked !== "other" ? picked : first;
-  return shown ? [shown, ...[...new Set([first, ...all])].filter((k) => k && k !== shown)] : [];
+  const shown = list.includes(picked) ? picked : list[0];
+  return shown ? [shown, ...list.filter((k) => k !== shown)] : [];
 };
 const ROLE = (p) => agentOf(p.program?.key, tabNameOf(p))?.role ?? (p.program?.shell ? "Terminal" : (p.program?.name ?? "Contractor"));
 

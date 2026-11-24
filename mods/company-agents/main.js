@@ -1529,13 +1529,16 @@ export default class Agents extends View {
     return this.sessions[a.address]?.ticket ?? ticketIn(tabNameOf(a));
   }
 
-  // Every ticket of the session, the one picked in the PRs panel first.
+  // Every ticket of the session not hidden in the PRs panel, the one picked there first.
   ticketsOf(a) {
+    const session = this.sessions[a.address];
     const first = this.ticketOf(a);
+    const gone = new Set(shared("pixel-hq.ticket-hidden")?.[session?.id] ?? []);
+    const all = [...new Set([first, ...(session?.tickets ?? [])])].filter(Boolean);
+    const list = all.some((k) => !gone.has(k)) ? all.filter((k) => !gone.has(k)) : all.slice(0, 1);
     const picked = shared("pixel-hq.ticket-tab")?.[a.address];
-    const shown = picked && picked !== "other" ? picked : first;
-    const all = this.sessions[a.address]?.tickets ?? [];
-    return shown ? [shown, ...[...new Set([first, ...all])].filter((k) => k && k !== shown)] : [];
+    const shown = list.includes(picked) ? picked : list[0];
+    return shown ? [shown, ...list.filter((k) => k !== shown)] : [];
   }
 
   render(cx) {

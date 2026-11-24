@@ -182,7 +182,7 @@ def print_prs(address, fresh=False):
     named = sessionlib.TICKET_RE.search(name)
     order = list(dict.fromkeys(([named.group(1).upper()] if named else []) + mentioned))
     ticket = session_ticket(order[0]) if order else None
-    print(json.dumps({"session": name, "ticket": ticket, "prs": prs, "tickets": ticket_tabs(sid, prs, order),
+    print(json.dumps({"session": name, "id": sid, "ticket": ticket, "prs": prs, "tickets": ticket_tabs(sid, prs, order),
                       "config": sessionlib.PUBLIC_CONFIG}))
 
 

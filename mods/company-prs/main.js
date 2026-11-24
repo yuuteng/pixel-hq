@@ -14,6 +14,8 @@ const HELPER = () => `${appHome()}/mods/company-prs/sessions.py`;
 const open = (url) => exec("open", [url]).catch(() => null);
 const TAB = "pixel-hq.ticket-tab";
 const tabId = (k) => k ?? "other";
+const HIDDEN = "pixel-hq.ticket-hidden";
+const stored = (key, fallback) => { try { return JSON.parse(localStorage.getItem(key) ?? "null") ?? fallback; } catch { return fallback; } };
 
 function tone(t, pr) {
   if (pr.state === "MERGED") return "#cba6f7";
@@ -37,6 +39,10 @@ export default class Prs extends View {
     this.address = null;
     this.data = { session: null, ticket: null, prs: [], tickets: [] };
     this.branchOnly = localStorage.getItem("branchOnly") === "1";
+    this.autoHide = localStorage.getItem("autoHide") !== "0";
+    this.hiding = stored("hidden", {});
+    this.showHidden = false;
+    this.publish();
     this.loading = false;
     this.docs = [];
     if (checking()) return;
@@ -67,6 +73,7 @@ export default class Prs extends View {
       this.loading = false;
       if (r?.code === 0) {
         try { this.data = JSON.parse(r.stdout); } catch {}
+        this.sync();
       }
       cx.notify();
     });
@@ -85,9 +92,70 @@ export default class Prs extends View {
     });
   }
 
-  // Tickets shown as tabs: the ones with a PR, plus the ones with a branch only when the option is on.
-  tabs() {
+  // Tickets of the session that can be a tab: the ones with a PR, plus the ones with a branch only when the option is on.
+  listed() {
     return (this.data.tickets ?? []).filter((k) => k.prs.length > 0 || this.branchOnly);
+  }
+
+  tabs() {
+    const gone = new Set(this.gone(this.data.id));
+    return this.listed().filter((k) => !gone.has(tabId(k.key)));
+  }
+
+  hiddenTabs() {
+    const gone = new Set(this.gone(this.data.id));
+    return this.listed().filter((k) => gone.has(tabId(k.key)));
+  }
+
+  // Tab ids hidden for a session: the closed ones, plus the finished ones while the option is on.
+  gone(id) {
+    const h = this.hiding[id];
+    if (!h) return [];
+    return [...new Set([...h.closed, ...(this.autoHide ? h.done.filter((k) => !h.kept.includes(k)) : [])])];
+  }
+
+  // Finished tickets of the focused session: done in Jira with every PR merged or declined. One tab always stays.
+  sync() {
+    const id = this.data.id;
+    if (!id) return;
+    const h = this.hiding[id] ?? { closed: [], kept: [], done: [] };
+    const state = new Map(this.data.prs.map((p) => [p.key, p.state]));
+    const done = this.listed().filter((k) => k.key && k.category === "Done" && k.prs.length > 0 && k.prs.every((p) => state.get(p) !== "OPEN"))
+      .map((k) => k.key);
+    const left = this.listed().filter((k) => !h.closed.includes(tabId(k.key)) && !(done.includes(k.key) && !h.kept.includes(k.key)));
+    if (!left.length && done.length) done.shift();
+    this.hiding = { ...this.hiding, [id]: { ...h, done } };
+    this.store();
+  }
+
+  store() {
+    localStorage.setItem("hidden", JSON.stringify(this.hiding));
+    this.publish();
+  }
+
+  publish() {
+    const next = Object.fromEntries(Object.keys(this.hiding).map((id) => [id, this.gone(id)]).filter(([, keys]) => keys.length));
+    if (JSON.stringify(next) !== JSON.stringify(shared(HIDDEN) ?? {})) setShared(HIDDEN, next);
+  }
+
+  close(key, cx) {
+    const id = this.data.id;
+    if (!id) return;
+    const h = this.hiding[id] ?? { closed: [], kept: [], done: [] };
+    this.hiding = { ...this.hiding, [id]: { ...h, closed: [...new Set([...h.closed, tabId(key)])], kept: h.kept.filter((k) => k !== key) } };
+    this.store();
+    cx.notify();
+  }
+
+  restore(key, cx) {
+    const id = this.data.id;
+    const h = this.hiding[id];
+    if (!h) return;
+    this.hiding = { ...this.hiding, [id]: { ...h, closed: h.closed.filter((k) => k !== tabId(key)), kept: [...new Set([...h.kept, tabId(key)])] } };
+    this.store();
+    if (!this.hiddenTabs().length) this.showHidden = false;
+    this.pick(key, cx);
+    cx.notify();
   }
 
   current(tabs) {
@@ -132,7 +200,8 @@ export default class Prs extends View {
     const cur = this.current(tabs);
     const ticket = cur?.key ? cur : null;
     const prs = cur ? this.data.prs.filter((p) => cur.prs.includes(p.key)) : [];
-    const hidden = (this.data.tickets ?? []).filter((k) => !k.prs.length).length;
+    const branchOnly = (this.data.tickets ?? []).filter((k) => !k.prs.length).length;
+    const hiddenTabs = this.hiddenTabs();
     const repos = new Map();
     for (const p of prs) { if (!repos.has(p.repo)) repos.set(p.repo, []); repos.get(p.repo).push(p); }
     const tab = (k) => {
@@ -146,9 +215,25 @@ export default class Prs extends View {
         .child(div().id(`tab-on-${tabId(k.key)}`).absolute().left(0).top(0).size_full().rounded(7).bg(t.surface ?? t.hover)
           .opacity(on ? 1 : 0).transition("opacity", { duration: 220, easing: "ease-out" }))
         .child(div().relative().child(k.key ?? "other"))
-        .child(div().relative().font_normal().text_color(t.dim).child(String(k.prs.length)));
+        .child(div().relative().font_normal().text_color(t.dim).child(String(k.prs.length)))
+        .child(div().id(`tab-close-${tabId(k.key)}`).relative().flex_none().w(16).h(16).rounded(4).flex().items_center().justify_center()
+          .font_normal().text_size(12).text_color(t.dim).hover((el) => el.bg("#f38ba826").text_color("#f38ba8"))
+          .tooltip("Hide this ticket").on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+          .on_click((_e, cx) => { cx.stop_propagation(); this.close(k.key, cx); }).child("×"));
     };
-    const tabRow = tabs.length > 1 && h_flex().flex_none().flex_wrap().gap(4).px(8).pb(8).children(tabs.map(tab));
+    const hiddenTab = (k) => h_flex().id(`tab-hidden-${tabId(k.key)}`).flex_none().h(28).px(10).gap(6).items_center().rounded(7).border_1()
+      .border_dashed().border_color(t.dim).text_size(11.5).text_color(t.dim).cursor_pointer()
+      .hover((el) => el.bg(t.hover).text_color(t.foreground))
+      .tooltip(`Show ${k.key ?? "other"} again${k.summary ? `\n${k.summary}` : ""}`)
+      .on_click((_e, cx) => this.restore(k.key, cx))
+      .child(k.key ?? "other");
+    const hiddenChip = hiddenTabs.length > 0 && div().id("tab-hidden").flex_none().h(28).px(8).rounded(7).flex().items_center()
+      .text_size(11).text_color(this.showHidden ? t.foreground : t.dim).cursor_pointer().hover((el) => el.bg(t.hover))
+      .tooltip(this.showHidden ? "Fold the hidden tickets" : "Show the hidden tickets")
+      .on_click((_e, cx) => { this.showHidden = !this.showHidden; cx.notify(); })
+      .child(`+${hiddenTabs.length} hidden`);
+    const tabRow = (tabs.length > 1 || hiddenTabs.length > 0) && h_flex().flex_none().flex_wrap().gap(4).px(8).pb(8)
+      .children([...tabs.map(tab), ...(hiddenChip ? [hiddenChip] : []), ...(this.showHidden ? hiddenTabs.map(hiddenTab) : [])]);
     const option = Boolean(session) && h_flex().id("prs-branch-only").flex_none().mx(8).mb(6).px(8).h(28).gap(8).items_center().rounded(7)
       .text_size(11).text_color(t.muted).cursor_pointer().hover((el) => el.bg(t.hover))
       .tooltip("Also show the tickets this session has a branch for and no PR yet")
@@ -161,7 +246,20 @@ export default class Prs extends View {
         .child(div().id("prs-branch-only-on").size_full().rounded(3).bg("#89b4fa")
           .opacity(this.branchOnly ? 1 : 0).transition("opacity", { duration: 180, easing: "ease-out" })))
       .child(div().flex_1().min_w(0).truncate().child("Tickets without a PR"))
-      .when(hidden > 0, (el) => el.child(div().flex_none().text_color(t.dim).child(String(hidden))));
+      .when(branchOnly > 0, (el) => el.child(div().flex_none().text_color(t.dim).child(String(branchOnly))));
+    const autoOption = Boolean(session) && h_flex().id("prs-auto-hide").flex_none().mx(8).mb(6).px(8).h(28).gap(8).items_center().rounded(7)
+      .text_size(11).text_color(t.muted).cursor_pointer().hover((el) => el.bg(t.hover))
+      .tooltip("Hide a ticket once it is done in Jira and its PRs are merged")
+      .on_click((_e, cx) => {
+        this.autoHide = !this.autoHide;
+        localStorage.setItem("autoHide", this.autoHide ? "1" : "0");
+        this.sync();
+        cx.notify();
+      })
+      .child(div().flex_none().w(13).h(13).rounded(4).border_1().border_color(this.autoHide ? "#89b4fa" : t.dim)
+        .child(div().id("prs-auto-hide-on").size_full().rounded(3).bg("#89b4fa")
+          .opacity(this.autoHide ? 1 : 0).transition("opacity", { duration: 180, easing: "ease-out" })))
+      .child(div().flex_1().min_w(0).truncate().child("Hide finished tickets"));
     const head = h_flex().h(32).flex_none().px(12).items_center().gap(6).text_size(11.5).text_color(t.dim)
       .child(div().flex_none().font_semibold().text_color(t.muted).child("PRs"))
       .child(div().flex_1().min_w(0).truncate().text_color(t.muted).child(session ?? ""))
@@ -219,6 +317,7 @@ export default class Prs extends View {
       .child(head)
       .when(Boolean(tabRow), (el) => el.child(tabRow))
       .when(Boolean(option), (el) => el.child(option))
+      .when(Boolean(autoOption), (el) => el.child(autoOption))
       .child(v_flex().id("prs-content").relative().flex_1().min_h(0)
         .top(this.entering ? 8 : 0).opacity(this.entering ? 0 : 1)
         .transition("top", { duration: this.entering ? 1 : 260, easing: "ease-out" })
